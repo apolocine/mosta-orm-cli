@@ -260,30 +260,31 @@ run_adapter_convert() {
 
   # Ensure @mostajs/orm-adapter is available — auto-install if missing
   info "Checking @mostajs/orm-adapter..."
-  local adapter_path=""
+  local adapter_base=""
 
   # 1. Try local project install
-  if [[ -f "$PROJECT_ROOT/node_modules/@mostajs/orm-adapter/dist/index.js" ]]; then
-    adapter_path="$PROJECT_ROOT/node_modules/@mostajs/orm-adapter/dist/index.js"
+  if [[ -d "$PROJECT_ROOT/node_modules/@mostajs/orm-adapter/dist" ]]; then
+    adapter_base="$PROJECT_ROOT/node_modules/@mostajs/orm-adapter/dist"
     ok "Using local install"
   else
     # 2. Try sibling (dev setup)
     local cli_dir
     cli_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    if [[ -f "$cli_dir/../mosta-orm-adapter/dist/index.js" ]]; then
-      adapter_path="$cli_dir/../mosta-orm-adapter/dist/index.js"
+    if [[ -d "$cli_dir/../mosta-orm-adapter/dist" ]]; then
+      adapter_base="$cli_dir/../mosta-orm-adapter/dist"
       info "Using sibling dev install"
     else
       # 3. Offer auto-install
       warn "Not installed locally"
       if ensure_pkg "@mostajs/orm-adapter" "@mostajs/orm"; then
-        adapter_path="$PROJECT_ROOT/node_modules/@mostajs/orm-adapter/dist/index.js"
-        if [[ ! -f "$adapter_path" ]]; then
-          # Try via require.resolve
-          adapter_path=$(resolve_pkg_path "@mostajs/orm-adapter") || {
+        adapter_base="$PROJECT_ROOT/node_modules/@mostajs/orm-adapter/dist"
+        if [[ ! -d "$adapter_base" ]]; then
+          local resolved
+          resolved=$(resolve_pkg_path "@mostajs/orm-adapter") || {
             err "Install reported success but module cannot be resolved."
             return 1
           }
+          adapter_base="$(dirname "$resolved")"
         fi
         ok "Installed"
       else
@@ -293,23 +294,39 @@ run_adapter_convert() {
     fi
   fi
 
+  # Use subpath-specific import to avoid loading ALL adapters (and their
+  # transitive deps : ajv, ref-parser, openapi-parser...). For example,
+  # importing only prisma.adapter.js avoids pulling in ajv-draft-04 issues
+  # when the project only needs Prisma conversion.
+  local adapter_file
   local adapter_class
   case "$input_type" in
-    prisma)     adapter_class="PrismaAdapter" ;;
-    openapi)    adapter_class="OpenApiAdapter" ;;
-    jsonschema) adapter_class="JsonSchemaAdapter" ;;
+    prisma)     adapter_file="$adapter_base/adapters/prisma.adapter.js"     ; adapter_class="PrismaAdapter" ;;
+    openapi)    adapter_file="$adapter_base/adapters/openapi.adapter.js"    ; adapter_class="OpenApiAdapter" ;;
+    jsonschema) adapter_file="$adapter_base/adapters/jsonschema.adapter.js" ; adapter_class="JsonSchemaAdapter" ;;
     *) err "Unknown input type: $input_type"; return 1 ;;
   esac
+
+  if [[ ! -f "$adapter_file" ]]; then
+    warn "Subpath import $adapter_file not found — falling back to root index.js"
+    adapter_file="$adapter_base/index.js"
+  fi
 
   cat > "$CONFIG_DIR/convert.mjs" << EOF
 import { readFileSync, writeFileSync } from 'fs';
 
 let adapterModule;
 try {
-  adapterModule = await import('$adapter_path');
+  adapterModule = await import('$adapter_file');
 } catch (e) {
-  console.error('Failed to import adapter from $adapter_path');
+  console.error('Failed to import adapter from $adapter_file');
   console.error('Reason :', e.message);
+  // Common issue : ajv/ref-parser/yaml resolution problems
+  if (e.message?.includes('ajv') || e.message?.includes('ref-parser') || e.message?.includes('yaml')) {
+    console.error();
+    console.error('Hint : this adapter requires peer deps that may be missing.');
+    console.error('Try : $PKG_MANAGER install ajv@^8 @apidevtools/json-schema-ref-parser@^11');
+  }
   process.exit(2);
 }
 const { $adapter_class } = adapterModule;
