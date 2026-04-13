@@ -594,7 +594,8 @@ prompt_dialect() {
         sqlite)      suggest="./data.sqlite" ;;
         postgres)    suggest="postgres://user:pw@localhost:5432/app" ;;
         mysql|mariadb) suggest="mysql://user:pw@localhost:3306/app" ;;
-        mongodb)     suggest="mongodb://localhost:27017/app" ;;
+        # MongoDB : include ?authSource=admin (common pitfall without it)
+        mongodb)     suggest="mongodb://devuser:devpass26@localhost:27017/app?authSource=admin" ;;
         mssql)       suggest="mssql://user:pw@localhost:1433/app" ;;
         oracle)      suggest="oracle://user:pw@localhost:1521/ORCLPDB" ;;
         db2)         suggest="db2://user:pw@localhost:50000/app" ;;
@@ -772,6 +773,46 @@ function stripScheme(uri) {
   return uri;
 }
 
+// Provide dialect-specific hints for common auth / connection errors.
+function hintFor(dialect, rawUri, err) {
+  const msg = (err && err.message) ? err.message : '';
+  const code = err && (err.code ?? err.codeName);
+
+  // MongoDB code 18 : Authentication failed → missing ?authSource=admin
+  if (dialect === 'mongodb' && (code === 18 || /AuthenticationFailed|18/.test(msg))) {
+    if (!/authSource=/.test(rawUri)) {
+      return 'MongoDB users are usually declared in the admin DB. Add ?authSource=admin to the URI :\n'
+        + '       ' + (rawUri.includes('?') ? rawUri + '&authSource=admin' : rawUri + '?authSource=admin');
+    }
+    return 'Verify credentials (username / password) in the URI.';
+  }
+
+  // PostgreSQL common errors
+  if (dialect === 'postgres' || dialect === 'cockroachdb') {
+    if (/password authentication failed/i.test(msg)) return 'Wrong PG password. Check the URI or run: psql "' + rawUri + '" -c "SELECT 1"';
+    if (/ECONNREFUSED|connect ECONNREFUSED/i.test(msg)) return 'PG server not running on that host/port. Try: pg_isready -h HOST -p PORT';
+    if (/no pg_hba.conf entry/i.test(msg)) return 'Server rejects the connection (pg_hba.conf). Add your IP or use SSL.';
+  }
+
+  // MySQL common errors
+  if (dialect === 'mysql' || dialect === 'mariadb') {
+    if (/Access denied for user/i.test(msg)) return 'Wrong MySQL password. Try: mysql -u USER -p -h HOST';
+    if (/ECONNREFUSED/i.test(msg)) return 'MySQL not running. Try: systemctl status mysql';
+  }
+
+  // SQLite common errors
+  if (dialect === 'sqlite') {
+    if (/SQLITE_CANTOPEN/i.test(msg)) return 'Cannot open SQLite file. Check the path exists and is writable.';
+  }
+
+  // Generic network errors
+  if (/ECONNREFUSED/i.test(msg)) return 'Service is not reachable at that host/port.';
+  if (/ENOTFOUND|getaddrinfo/i.test(msg)) return 'DNS resolution failed. Check the hostname.';
+  if (/ETIMEDOUT/i.test(msg)) return 'Connection timed out. Check firewall / VPN / host.';
+
+  return null;
+}
+
 let ok = 0, fail = 0;
 for (const [dialect, rawUri] of pairs) {
   const uri = dialect === 'sqlite' ? stripScheme(rawUri) : rawUri;
@@ -790,6 +831,9 @@ for (const [dialect, rawUri] of pairs) {
   } catch (e) {
     console.error('  \u2717 ' + (e.message ?? e));
     if (e.code) console.error('    code : ' + e.code);
+    if (e.codeName) console.error('    codeName : ' + e.codeName);
+    const hint = hintFor(dialect, rawUri, e);
+    if (hint) console.error('    \u2192 ' + hint);
     fail++;
   }
 }
@@ -800,7 +844,66 @@ EOF
 
   cd "$PROJECT_ROOT"
   node "$CONFIG_DIR/test-connections.mjs" "${args[@]}" 2>&1 | tee "$LOG_DIR/test-connections.log"
+  local test_rc=${PIPESTATUS[0]}
   echo
+
+  # Offer to auto-fix common MongoDB auth issue (missing ?authSource=admin)
+  if [[ $test_rc -ne 0 ]] && grep -qE "authSource=admin|AuthenticationFailed|code : 18" "$LOG_DIR/test-connections.log"; then
+    echo
+    warn "Detected MongoDB authentication failure that is usually fixed by adding"
+    warn "  ?authSource=admin  to the URI."
+    if confirm "Append '?authSource=admin' to your MongoDB URI now?"; then
+      # Fix the primary SGBD_URI if it's mongodb
+      if [[ "${DB_DIALECT:-}" == "mongodb" ]] && [[ -n "${SGBD_URI:-}" ]] && [[ ! "$SGBD_URI" =~ authSource= ]]; then
+        local new_uri
+        if [[ "$SGBD_URI" =~ \? ]]; then
+          new_uri="${SGBD_URI}&authSource=admin"
+        else
+          new_uri="${SGBD_URI}?authSource=admin"
+        fi
+        save_var SGBD_URI "$new_uri"
+        ok "Updated SGBD_URI : $new_uri"
+      fi
+      # Fix any MongoDB extra binding missing authSource
+      if [[ -n "${EXTRA_BINDINGS:-}" ]]; then
+        local new_bindings=""
+        local IFS=';'
+        for b in $EXTRA_BINDINGS; do
+          local name="${b%%:*}"
+          local rest="${b#*:}"
+          local dialect="${rest%%:*}"
+          local uri="${rest#*:}"
+          if [[ "$dialect" == "mongodb" ]] && [[ ! "$uri" =~ authSource= ]]; then
+            if [[ "$uri" =~ \? ]]; then
+              uri="${uri}&authSource=admin"
+            else
+              uri="${uri}?authSource=admin"
+            fi
+          fi
+          new_bindings+="${new_bindings:+;}${name}:${dialect}:${uri}"
+        done
+        IFS=$' \t\n'
+        save_var EXTRA_BINDINGS "$new_bindings"
+        ok "Updated EXTRA_BINDINGS"
+      fi
+      echo
+      info "Re-running the test with the fixed URI..."
+      # Rebuild args with fresh env
+      load_env
+      args=()
+      [[ -n "${DB_DIALECT:-}" && -n "${SGBD_URI:-}" ]] && args+=("${DB_DIALECT}|${SGBD_URI}")
+      if [[ -n "${EXTRA_BINDINGS:-}" ]]; then
+        local IFS=';'
+        for b in $EXTRA_BINDINGS; do
+          local rest="${b#*:}"
+          args+=("${rest%%:*}|${rest#*:}")
+        done
+        IFS=$' \t\n'
+      fi
+      node "$CONFIG_DIR/test-connections.mjs" "${args[@]}" 2>&1 | tee "$LOG_DIR/test-connections.log"
+    fi
+  fi
+
   pause
 }
 
@@ -908,6 +1011,21 @@ const schemaStrategy = process.env.DB_SCHEMA_STRATEGY ?? 'update';
 const poolSize = parseInt(process.env.DB_POOL_SIZE ?? '20', 10);
 const showSql = process.env.DB_SHOW_SQL === 'true';
 
+function hintFor(dialect, rawUri, err) {
+  const msg = (err && err.message) ? err.message : '';
+  const code = err && (err.code ?? err.codeName);
+  if (dialect === 'mongodb' && (code === 18 || /AuthenticationFailed|18/.test(msg))) {
+    if (!/authSource=/.test(rawUri)) {
+      return 'Missing ?authSource=admin on MongoDB URI. Try :\n       '
+        + (rawUri.includes('?') ? rawUri + '&authSource=admin' : rawUri + '?authSource=admin');
+    }
+  }
+  if (/ECONNREFUSED/i.test(msg)) return 'Service not running at that host/port';
+  if (/ENOTFOUND/i.test(msg))    return 'DNS resolution failed';
+  if (/ETIMEDOUT/i.test(msg))    return 'Connection timed out';
+  return null;
+}
+
 for (const [dialect, rawUri] of pairs) {
   const uri = dialect === 'sqlite' ? stripScheme(rawUri) : rawUri;
   process.stdout.write('→ ' + dialect.padEnd(12) + ' : ' + rawUri + '\n');
@@ -920,6 +1038,8 @@ for (const [dialect, rawUri] of pairs) {
   } catch (e) {
     console.error('  ✗ ' + dialect + ' failed : ' + (e.message ?? e));
     if (e.code) console.error('    code : ' + e.code);
+    const hint = hintFor(dialect, rawUri, e);
+    if (hint) console.error('    → ' + hint);
     fail++;
   }
 }
