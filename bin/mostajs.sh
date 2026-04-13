@@ -548,6 +548,7 @@ menu_databases() {
   echo -e "  ${CYAN}p${RESET}) APP_PORT            : ${DIM}${APP_PORT:-3000}${RESET}"
   echo
   echo -e "  ${CYAN}t${RESET}) Test all connections"
+  echo -e "  ${CYAN}i${RESET}) ${BOLD}Import from project .env${RESET} (auto-detect app's real DB)"
   echo -e "  ${CYAN}e${RESET}) Export to .env.local in project"
   echo -e "  ${CYAN}r${RESET}) Reset config"
   echo -e "  ${CYAN}b${RESET}) Back"
@@ -565,6 +566,7 @@ menu_databases() {
     n|N) save_var MOSTA_NET_TRANSPORT "$(ask 'MOSTA_NET_TRANSPORT (rest|sse|graphql|mcp|websocket|jsonrpc|grpc|odata)' "${MOSTA_NET_TRANSPORT:-rest}")";;
     p|P) save_var APP_PORT            "$(ask 'APP_PORT' "${APP_PORT:-3000}")";;
     t|T) action_test_connections; return;;
+    i|I) action_import_env ;;
     e|E) export_env_local ;;
     r|R) confirm "Really reset config?" && rm -f "$CONFIG_FILE" && ok "Reset";;
     b|B) return;;
@@ -645,6 +647,95 @@ list_extra_bindings() {
     local uri="${rest#*:}"
     echo -e "  ${CYAN}$name${RESET} → ${MAGENTA}$dialect${RESET} @ ${DIM}$uri${RESET}"
   done
+}
+
+# Import DB config from the project's own .env file.
+# This is CRUCIAL when your app (Prisma, NextAuth, ...) already has a
+# DATABASE_URL / MONGODB_URI / POSTGRES_URL. Seeding the wrong DB leads to
+# the classic "users are in mosta-net /api/v1/users but login fails" bug.
+action_import_env() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Import DB config from project .env${RESET}"
+  echo
+
+  local candidates=(".env.local" ".env" ".env.production" ".env.development")
+  local -a available=()
+  for f in "${candidates[@]}"; do
+    [[ -f "$PROJECT_ROOT/$f" ]] && available+=("$f")
+  done
+
+  if [[ ${#available[@]} -eq 0 ]]; then
+    err "No .env* file found in $PROJECT_ROOT"
+    pause; return
+  fi
+
+  echo "Found env files :"
+  local i=1
+  for f in "${available[@]}"; do
+    echo -e "  ${CYAN}$i${RESET}) $f"
+    i=$((i+1))
+  done
+  echo
+  local choice; choice=$(ask "Number" 1)
+  local src_file="${available[$((choice-1))]}"
+  [[ -z "$src_file" ]] && return
+  local src_path="$PROJECT_ROOT/$src_file"
+
+  # Extract common DB URI variables — priority order matters
+  # MONGODB_URI > DATABASE_URL > POSTGRES_URL > MYSQL_URL > SGBD_URI
+  local found_uri="" found_var="" found_dialect=""
+  for var in SGBD_URI DATABASE_URL MONGODB_URI POSTGRES_URL POSTGRES_URI MYSQL_URL MYSQL_URI POSTGRESQL_URL; do
+    # Read value, skip commented lines, strip quotes
+    local val
+    val=$(grep -E "^${var}=" "$src_path" 2>/dev/null | grep -v "^#" | head -1 | sed "s/^${var}=//" | sed 's/^"\(.*\)"$/\1/' | sed "s/^'\(.*\)'$/\1/")
+    if [[ -n "$val" ]]; then
+      found_uri="$val"
+      found_var="$var"
+      break
+    fi
+  done
+
+  if [[ -z "$found_uri" ]]; then
+    err "No DB URI found in $src_file"
+    info "Searched : SGBD_URI, DATABASE_URL, MONGODB_URI, POSTGRES_URL/URI, MYSQL_URL/URI"
+    pause; return
+  fi
+
+  # Detect dialect from URI scheme
+  found_dialect=$(detect_dialect_from_uri "$found_uri")
+  if [[ "$found_dialect" == "unknown" ]]; then
+    warn "Could not auto-detect dialect from URI: $found_uri"
+    found_dialect=$(ask "Dialect name (mongodb|postgres|mysql|...)" "")
+    [[ -z "$found_dialect" ]] && { pause; return; }
+  fi
+
+  info "Detected :"
+  echo -e "  Variable : ${CYAN}$found_var${RESET}"
+  echo -e "  URI      : ${DIM}$found_uri${RESET}"
+  echo -e "  Dialect  : ${MAGENTA}$found_dialect${RESET}"
+  echo
+
+  # Special Prisma note
+  if [[ "$found_var" == "MONGODB_URI" ]] || [[ "$found_var" == "DATABASE_URL" ]]; then
+    dim "  (This is likely the Prisma datasource — the same DB your app uses for login/auth.)"
+    echo
+  fi
+
+  if confirm "Save as DB_DIALECT + SGBD_URI ?"; then
+    save_var DB_DIALECT "$found_dialect"
+    save_var SGBD_URI   "$found_uri"
+    # Suggest a strategy based on environment context
+    if [[ "$src_file" == ".env.production" ]]; then
+      save_var DB_SCHEMA_STRATEGY "validate"
+      info "Auto-set DB_SCHEMA_STRATEGY=validate (production)"
+    elif [[ -z "${DB_SCHEMA_STRATEGY:-}" ]]; then
+      save_var DB_SCHEMA_STRATEGY "update"
+    fi
+    ok "Config imported"
+    echo
+    info "Next step : menu 2 → t (test connection), then menu S → 4 (seed)"
+  fi
+  pause
 }
 
 # Export a .env.local file compatible with @mostajs/orm convention
