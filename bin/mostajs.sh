@@ -1144,9 +1144,79 @@ svc_start_dev() {
 }
 
 svc_start_mostanet() {
-  warn "mosta-net server not yet installed. Provision with :"
-  dim "  $PKG_MANAGER install @mostajs/net"
-  dim "  then run : npx mosta-net --entities .mostajs/generated/entities.ts"
+  load_env
+  cd "$PROJECT_ROOT" || return
+
+  if [[ ! -f "$GENERATED_DIR/entities.json" ]]; then
+    err "No entities.json — run menu 1 (Convert) first"
+    return
+  fi
+
+  # Ensure @mostajs/net AND its peer deps are installed
+  info "Checking @mostajs/net + peer dependencies..."
+  if ! ensure_pkg "@mostajs/net" "@mostajs/orm" "@mostajs/mproject" "@mostajs/replicator"; then
+    err "Cannot start mosta-net server without these packages."
+    return
+  fi
+
+  # Make our entities available to mostajs-net via schemas.json
+  # (mostajs-net's server.js looks for ./schemas.json in CWD)
+  if [[ ! -L schemas.json && ! -f schemas.json ]]; then
+    ln -sf "$GENERATED_DIR/entities.json" "$PROJECT_ROOT/schemas.json" 2>/dev/null \
+      || cp "$GENERATED_DIR/entities.json" "$PROJECT_ROOT/schemas.json"
+    ok "Linked schemas.json → $GENERATED_DIR/entities.json"
+  fi
+
+  # Derive port from MOSTA_NET_URL
+  local mosta_port=14488
+  if [[ "${MOSTA_NET_URL:-}" =~ :([0-9]+) ]]; then
+    mosta_port="${BASH_REMATCH[1]}"
+  fi
+
+  # Prepare env for the child process
+  # - DB vars : DB_DIALECT, SGBD_URI, DB_SCHEMA_STRATEGY, ...
+  # - MOSTA_NET_PORT : derived from MOSTA_NET_URL
+  # - MOSTA_NET_<transport>_ENABLED=true
+  local transport="${MOSTA_NET_TRANSPORT:-rest}"
+  local tr_upper="$(echo "$transport" | tr '[:lower:]' '[:upper:]')"
+
+  info "Launching mostajs-net serve (port $mosta_port, transport $transport)"
+  info "Logs → $LOG_DIR/mostanet.log"
+
+  local launcher
+  if [[ -x "$PROJECT_ROOT/node_modules/.bin/mostajs-net" ]]; then
+    launcher="$PROJECT_ROOT/node_modules/.bin/mostajs-net"
+  else
+    launcher="npx mostajs-net"
+  fi
+
+  # Launch detached with all env vars
+  (
+    export DB_DIALECT="${DB_DIALECT:-sqlite}"
+    export SGBD_URI="${SGBD_URI:-./data.sqlite}"
+    export DB_SCHEMA_STRATEGY="${DB_SCHEMA_STRATEGY:-update}"
+    export DB_POOL_SIZE="${DB_POOL_SIZE:-20}"
+    export DB_SHOW_SQL="${DB_SHOW_SQL:-false}"
+    export MOSTA_NET_PORT="$mosta_port"
+    export "MOSTA_NET_${tr_upper}_ENABLED"="true"
+    # Also enable MCP alongside — commonly wanted for AI integrations
+    [[ "$tr_upper" != "MCP" && "${MOSTA_NET_ALSO_MCP:-true}" == "true" ]] && export MOSTA_NET_MCP_ENABLED=true
+    nohup $launcher serve >> "$LOG_DIR/mostanet.log" 2>&1 &
+    echo "$!" > "$LOG_DIR/mostanet.pid"
+  )
+  local pid
+  pid=$(cat "$LOG_DIR/mostanet.pid" 2>/dev/null || echo "?")
+  ok "Started (PID $pid)"
+  echo
+  info "Endpoints (wait 2-3 seconds then hit them) :"
+  dim "  REST CRUD : http://localhost:${mosta_port}/api/v1/<collection>"
+  dim "              (collection = snake_case plural, e.g. /api/v1/users)"
+  dim "  MCP (AI)  : http://localhost:${mosta_port}/mcp"
+  dim "  Tail log  : tail -f $LOG_DIR/mostanet.log"
+  echo
+  info "Try it :"
+  dim "  curl http://localhost:${mosta_port}/api/v1/users"
+  dim "  curl http://localhost:${mosta_port}/api/v1/members"
 }
 
 svc_stop_all() {
