@@ -53,6 +53,110 @@ warn()  { echo -e "  ${YELLOW}⚠${RESET} $*"; }
 err()   { echo -e "  ${RED}✗${RESET} $*"; }
 dim()   { echo -e "  ${DIM}$*${RESET}"; }
 
+# ============================================================
+# ERROR HANDLING + AUTO-INSTALL
+# ============================================================
+
+# Run a node command with clean error reporting.
+# Usage: run_node <script_path> [env=val ...]
+run_node() {
+  local script="$1"; shift
+  local envvars=("$@")
+  local rc=0
+  if [[ ${#envvars[@]} -gt 0 ]]; then
+    env "${envvars[@]}" node "$script" 2>&1
+  else
+    node "$script" 2>&1
+  fi
+  rc=${PIPESTATUS[0]}
+  if [[ $rc -ne 0 ]]; then
+    err "Script failed (exit $rc)"
+    return $rc
+  fi
+  return 0
+}
+
+# Check if a package is installed locally; if not, offer to install it.
+# Usage: ensure_pkg <package-name> [<additional-pkg> ...]
+ensure_pkg() {
+  local pkgs=("$@")
+  local missing=()
+  for pkg in "${pkgs[@]}"; do
+    # Try to resolve via node's require resolution (works for any layout)
+    if ! node -e "require.resolve('$pkg')" >/dev/null 2>&1; then
+      # Also check if there's a node_modules with it
+      if [[ ! -d "$PROJECT_ROOT/node_modules/$pkg" ]]; then
+        missing+=("$pkg")
+      fi
+    fi
+  done
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  warn "Missing package(s): ${missing[*]}"
+  if confirm "Install now with $PKG_MANAGER?"; then
+    cd "$PROJECT_ROOT" || return 1
+    case "$PKG_MANAGER" in
+      pnpm) pnpm add "${missing[@]}" 2>&1 | tail -5 ;;
+      yarn) yarn add "${missing[@]}" 2>&1 | tail -5 ;;
+      bun)  bun add "${missing[@]}" 2>&1 | tail -5 ;;
+      *)    npm install --save "${missing[@]}" --legacy-peer-deps 2>&1 | tail -5 ;;
+    esac
+    local rc=${PIPESTATUS[0]}
+    if [[ $rc -ne 0 ]]; then
+      err "Install failed"
+      return $rc
+    fi
+    ok "Installed"
+    return 0
+  else
+    err "Cannot proceed without: ${missing[*]}"
+    return 1
+  fi
+}
+
+# Resolve path to a specific installed package module file
+# Usage: resolve_pkg <package>/dist/index.js
+# Writes path to stdout; returns 0 on success, 1 on failure
+resolve_pkg_path() {
+  local pkg="$1"
+  local result
+  result=$(node -e "
+    try {
+      const p = require.resolve('$pkg', { paths: [process.cwd(), '$PROJECT_ROOT'] });
+      console.log(p);
+    } catch (e) {
+      process.exit(1);
+    }
+  " 2>/dev/null) || return 1
+  echo "$result"
+}
+
+# Check if a driver is needed for the given dialect, and install it if missing.
+# Usage: ensure_dialect_driver <dialect>
+ensure_dialect_driver() {
+  local dialect="$1"
+  local driver=""
+  case "$dialect" in
+    sqlite)      driver="better-sqlite3" ;;
+    postgres|cockroachdb) driver="pg" ;;
+    mysql)       driver="mysql2" ;;
+    mariadb)     driver="mariadb" ;;
+    mssql)       driver="mssql" ;;
+    oracle)      driver="oracledb" ;;
+    db2)         driver="ibm_db" ;;
+    hana)        driver="@sap/hana-client" ;;
+    spanner)     driver="@google-cloud/spanner" ;;
+    sybase)      driver="sybase" ;;
+    mongodb)     driver="mongoose" ;;
+    *) return 0 ;;
+  esac
+  [[ -z "$driver" ]] && return 0
+  ensure_pkg "$driver"
+}
+
 pause() {
   echo
   read -n 1 -r -s -p "$(echo -e "${DIM}Press any key...${RESET}")" || true
@@ -154,29 +258,34 @@ run_adapter_convert() {
   local input_file="$2"
   local output_file="$3"
 
-  # Check if @mostajs/orm-adapter is installed locally
+  # Ensure @mostajs/orm-adapter is available — auto-install if missing
+  info "Checking @mostajs/orm-adapter..."
   local adapter_path=""
+
+  # 1. Try local project install
   if [[ -f "$PROJECT_ROOT/node_modules/@mostajs/orm-adapter/dist/index.js" ]]; then
     adapter_path="$PROJECT_ROOT/node_modules/@mostajs/orm-adapter/dist/index.js"
-    info "Using local @mostajs/orm-adapter"
+    ok "Using local install"
   else
-    # Try a neighbor path (dev setup — mosta-orm-adapter may be next to this CLI)
+    # 2. Try sibling (dev setup)
     local cli_dir
     cli_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
     if [[ -f "$cli_dir/../mosta-orm-adapter/dist/index.js" ]]; then
       adapter_path="$cli_dir/../mosta-orm-adapter/dist/index.js"
-      info "Using sibling @mostajs/orm-adapter from $adapter_path"
+      info "Using sibling dev install"
     else
-      warn "@mostajs/orm-adapter not found locally."
-      if confirm "Install it now ($PKG_MANAGER install --save-dev @mostajs/orm-adapter @mostajs/orm)?"; then
-        cd "$PROJECT_ROOT"
-        case "$PKG_MANAGER" in
-          pnpm) pnpm add -D @mostajs/orm-adapter @mostajs/orm ;;
-          yarn) yarn add -D @mostajs/orm-adapter @mostajs/orm ;;
-          bun)  bun add -D @mostajs/orm-adapter @mostajs/orm ;;
-          *)    npm install --save-dev @mostajs/orm-adapter @mostajs/orm --legacy-peer-deps ;;
-        esac
+      # 3. Offer auto-install
+      warn "Not installed locally"
+      if ensure_pkg "@mostajs/orm-adapter" "@mostajs/orm"; then
         adapter_path="$PROJECT_ROOT/node_modules/@mostajs/orm-adapter/dist/index.js"
+        if [[ ! -f "$adapter_path" ]]; then
+          # Try via require.resolve
+          adapter_path=$(resolve_pkg_path "@mostajs/orm-adapter") || {
+            err "Install reported success but module cannot be resolved."
+            return 1
+          }
+        fi
+        ok "Installed"
       else
         err "Cannot proceed without the adapter."
         return 1
@@ -194,13 +303,42 @@ run_adapter_convert() {
 
   cat > "$CONFIG_DIR/convert.mjs" << EOF
 import { readFileSync, writeFileSync } from 'fs';
-import { $adapter_class } from '$adapter_path';
 
-const source = readFileSync('$input_file', 'utf8');
+let adapterModule;
+try {
+  adapterModule = await import('$adapter_path');
+} catch (e) {
+  console.error('Failed to import adapter from $adapter_path');
+  console.error('Reason :', e.message);
+  process.exit(2);
+}
+const { $adapter_class } = adapterModule;
+if (!$adapter_class) {
+  console.error('$adapter_class not exported from the adapter module');
+  process.exit(3);
+}
+
+let source;
+try {
+  source = readFileSync('$input_file', 'utf8');
+} catch (e) {
+  console.error('Cannot read input file : $input_file');
+  console.error('Reason :', e.message);
+  process.exit(4);
+}
+
 const adapter = new $adapter_class();
 const warnings = [];
 const input = '$input_type' === 'jsonschema' ? JSON.parse(source) : source;
-const entities = await adapter.toEntitySchema(input, { onWarning: w => warnings.push(w) });
+
+let entities;
+try {
+  entities = await adapter.toEntitySchema(input, { onWarning: w => warnings.push(w) });
+} catch (e) {
+  console.error('Conversion failed :', e.message);
+  if (e.details) console.error('Details :', JSON.stringify(e.details, null, 2).slice(0, 500));
+  process.exit(5);
+}
 
 console.log('entities : ' + entities.length);
 console.log('warnings : ' + warnings.length);
@@ -217,12 +355,28 @@ const code = header +
   '  entities.map(e => [e.name, e])\n' +
   ');\n';
 
-writeFileSync('$output_file', code);
-console.log('\u2713 Saved : $output_file');
+try {
+  writeFileSync('$output_file', code);
+  // Also write .json (easier to load from ESM without TS support)
+  const jsonFile = '$output_file'.replace(/\.ts$/, '.json');
+  writeFileSync(jsonFile, JSON.stringify(entities, null, 2));
+  console.log('\u2713 Saved : $output_file');
+  console.log('\u2713 Saved : ' + jsonFile);
+} catch (e) {
+  console.error('Cannot write output : ' + e.message);
+  process.exit(6);
+}
 EOF
 
+  local rc=0
   node "$CONFIG_DIR/convert.mjs" 2>&1 | tee "$LOG_DIR/convert.log"
-  return "${PIPESTATUS[0]}"
+  rc=${PIPESTATUS[0]}
+  if [[ $rc -ne 0 ]]; then
+    err "Conversion exited with code $rc"
+    info "See $LOG_DIR/convert.log for details"
+    return $rc
+  fi
+  return 0
 }
 
 # ============================================================
@@ -356,37 +510,43 @@ menu_databases() {
   header
   echo -e "${BOLD}${MAGENTA}▶ Database configuration${RESET}"
   echo
-  echo -e "  ${CYAN}1${RESET}) MongoDB           : ${DIM}${MONGODB_URI:-<not set>}${RESET}"
-  echo -e "  ${CYAN}2${RESET}) PostgreSQL        : ${DIM}${POSTGRES_URI:-<not set>}${RESET}"
-  echo -e "  ${CYAN}3${RESET}) MySQL / MariaDB   : ${DIM}${MYSQL_URI:-<not set>}${RESET}"
-  echo -e "  ${CYAN}4${RESET}) SQLite            : ${DIM}${SQLITE_URI:-<not set>}${RESET}"
-  echo -e "  ${CYAN}5${RESET}) Oracle            : ${DIM}${ORACLE_URI:-<not set>}${RESET}"
-  echo -e "  ${CYAN}6${RESET}) MSSQL             : ${DIM}${MSSQL_URI:-<not set>}${RESET}"
-  echo -e "  ${CYAN}7${RESET}) DB2               : ${DIM}${DB2_URI:-<not set>}${RESET}"
-  echo -e "  ${CYAN}8${RESET}) HANA              : ${DIM}${HANA_URI:-<not set>}${RESET}"
-  echo -e "  ${CYAN}9${RESET}) CockroachDB       : ${DIM}${COCKROACH_URI:-<not set>}${RESET}"
+  echo -e "${DIM}Compatible with @mostajs/orm .env convention (see SecuAccessPro/.env.local)${RESET}"
   echo
-  echo -e "  ${CYAN}p${RESET}) App port (Next.js/Express) : ${DIM}${APP_PORT:-3000}${RESET}"
-  echo -e "  ${CYAN}n${RESET}) mosta-net port              : ${DIM}${MOSTA_NET_PORT:-4447}${RESET}"
+  echo -e "${BOLD}Primary DB (single backend — 90% of apps) :${RESET}"
+  echo -e "  ${CYAN}1${RESET}) DB_DIALECT          : ${DIM}${DB_DIALECT:-<not set>}${RESET}"
+  echo -e "  ${CYAN}2${RESET}) SGBD_URI            : ${DIM}${SGBD_URI:-<not set>}${RESET}"
+  echo -e "  ${CYAN}3${RESET}) DB_SCHEMA_STRATEGY  : ${DIM}${DB_SCHEMA_STRATEGY:-update}${RESET}"
+  echo -e "  ${CYAN}4${RESET}) DB_POOL_SIZE        : ${DIM}${DB_POOL_SIZE:-20}${RESET}"
+  echo -e "  ${CYAN}5${RESET}) DB_SHOW_SQL         : ${DIM}${DB_SHOW_SQL:-false}${RESET}"
+  echo
+  echo -e "${BOLD}Extra DBs (hybrid apps with Prisma Bridge) :${RESET}"
+  echo -e "  ${CYAN}a${RESET}) Add extra binding   ${DIM}(e.g. MongoDB for audit while PG is primary)${RESET}"
+  echo -e "  ${CYAN}l${RESET}) List extra bindings : ${DIM}${EXTRA_BINDINGS:-<none>}${RESET}"
+  echo
+  echo -e "${BOLD}mosta-net + app :${RESET}"
+  echo -e "  ${CYAN}u${RESET}) MOSTA_NET_URL       : ${DIM}${MOSTA_NET_URL:-http://localhost:14488}${RESET}"
+  echo -e "  ${CYAN}n${RESET}) MOSTA_NET_TRANSPORT : ${DIM}${MOSTA_NET_TRANSPORT:-rest}${RESET}"
+  echo -e "  ${CYAN}p${RESET}) APP_PORT            : ${DIM}${APP_PORT:-3000}${RESET}"
   echo
   echo -e "  ${CYAN}t${RESET}) Test all connections"
+  echo -e "  ${CYAN}e${RESET}) Export to .env.local in project"
   echo -e "  ${CYAN}r${RESET}) Reset config"
   echo -e "  ${CYAN}b${RESET}) Back"
   echo
   local choice; choice=$(ask "Choice" "1")
   case "$choice" in
-    1) save_var MONGODB_URI   "$(ask 'MongoDB URI' "${MONGODB_URI:-mongodb://localhost:27017/app}")";;
-    2) save_var POSTGRES_URI  "$(ask 'PostgreSQL URI' "${POSTGRES_URI:-postgres://user:pw@localhost:5432/app}")";;
-    3) save_var MYSQL_URI     "$(ask 'MySQL/MariaDB URI' "${MYSQL_URI:-mysql://user:pw@localhost:3306/app}")";;
-    4) save_var SQLITE_URI    "$(ask 'SQLite path or :memory:' "${SQLITE_URI:-./data.sqlite}")";;
-    5) save_var ORACLE_URI    "$(ask 'Oracle URI' "${ORACLE_URI:-oracle://user:pw@localhost:1521/ORCLPDB}")";;
-    6) save_var MSSQL_URI     "$(ask 'MSSQL URI' "${MSSQL_URI:-mssql://user:pw@localhost:1433/app}")";;
-    7) save_var DB2_URI       "$(ask 'DB2 URI' "${DB2_URI:-db2://user:pw@localhost:50000/app}")";;
-    8) save_var HANA_URI      "$(ask 'HANA URI' "${HANA_URI:-hana://user:pw@localhost:39041}")";;
-    9) save_var COCKROACH_URI "$(ask 'CockroachDB URI' "${COCKROACH_URI:-postgres://user@localhost:26257/app}")";;
-    p|P) save_var APP_PORT       "$(ask 'App port' "${APP_PORT:-3000}")";;
-    n|N) save_var MOSTA_NET_PORT "$(ask 'mosta-net port' "${MOSTA_NET_PORT:-4447}")";;
+    1) prompt_dialect ;;
+    2) save_var SGBD_URI           "$(ask 'SGBD_URI (path or connection string)' "${SGBD_URI:-./data.sqlite}")";;
+    3) save_var DB_SCHEMA_STRATEGY "$(ask 'DB_SCHEMA_STRATEGY (update|create|validate|none|create-drop)' "${DB_SCHEMA_STRATEGY:-update}")";;
+    4) save_var DB_POOL_SIZE       "$(ask 'DB_POOL_SIZE' "${DB_POOL_SIZE:-20}")";;
+    5) save_var DB_SHOW_SQL        "$(ask 'DB_SHOW_SQL (true|false)' "${DB_SHOW_SQL:-false}")";;
+    a|A) add_extra_binding ;;
+    l|L) list_extra_bindings; pause ;;
+    u|U) save_var MOSTA_NET_URL       "$(ask 'MOSTA_NET_URL' "${MOSTA_NET_URL:-http://localhost:14488}")";;
+    n|N) save_var MOSTA_NET_TRANSPORT "$(ask 'MOSTA_NET_TRANSPORT (rest|sse|graphql|mcp|websocket|jsonrpc|grpc|odata)' "${MOSTA_NET_TRANSPORT:-rest}")";;
+    p|P) save_var APP_PORT            "$(ask 'APP_PORT' "${APP_PORT:-3000}")";;
     t|T) action_test_connections; return;;
+    e|E) export_env_local ;;
     r|R) confirm "Really reset config?" && rm -f "$CONFIG_FILE" && ok "Reset";;
     b|B) return;;
     *) warn "Unknown";;
@@ -395,38 +555,235 @@ menu_databases() {
   menu_databases
 }
 
+# Prompt user to choose a dialect from a numbered list
+prompt_dialect() {
+  echo
+  echo "Pick a dialect:"
+  local i=1
+  local -a dialects=(sqlite postgres mysql mariadb mongodb mssql oracle db2 cockroachdb hana hsqldb spanner sybase)
+  for d in "${dialects[@]}"; do
+    echo -e "  ${CYAN}$i${RESET}) $d"
+    i=$((i+1))
+  done
+  local num; num=$(ask "Number" 1)
+  local idx=$((num-1))
+  if [[ $idx -ge 0 && $idx -lt ${#dialects[@]} ]]; then
+    local d="${dialects[$idx]}"
+    save_var DB_DIALECT "$d"
+    # Suggest default URI for that dialect if SGBD_URI is empty
+    if [[ -z "${SGBD_URI:-}" ]]; then
+      local suggest
+      case "$d" in
+        sqlite)      suggest="./data.sqlite" ;;
+        postgres)    suggest="postgres://user:pw@localhost:5432/app" ;;
+        mysql|mariadb) suggest="mysql://user:pw@localhost:3306/app" ;;
+        mongodb)     suggest="mongodb://localhost:27017/app" ;;
+        mssql)       suggest="mssql://user:pw@localhost:1433/app" ;;
+        oracle)      suggest="oracle://user:pw@localhost:1521/ORCLPDB" ;;
+        db2)         suggest="db2://user:pw@localhost:50000/app" ;;
+        cockroachdb) suggest="postgres://user@localhost:26257/app" ;;
+        hana)        suggest="hana://user:pw@localhost:39041" ;;
+        *)           suggest="" ;;
+      esac
+      [[ -n "$suggest" ]] && save_var SGBD_URI "$(ask 'SGBD_URI' "$suggest")"
+    fi
+  else
+    warn "Invalid number"
+  fi
+}
+
+# Add an extra dialect binding for hybrid apps
+add_extra_binding() {
+  local name; name=$(ask "Binding name (e.g. AuditLog, Reports) — used by the Prisma Bridge")
+  [[ -z "$name" ]] && return
+  local dialect; dialect=$(ask "Dialect for $name (sqlite|postgres|mongodb|oracle|...)")
+  [[ -z "$dialect" ]] && return
+  local uri; uri=$(ask "URI for $name")
+  [[ -z "$uri" ]] && return
+  local current="${EXTRA_BINDINGS:-}"
+  local new="${name}:${dialect}:${uri}"
+  if [[ -z "$current" ]]; then
+    save_var EXTRA_BINDINGS "$new"
+  else
+    save_var EXTRA_BINDINGS "${current};${new}"
+  fi
+  ok "Added: $name ($dialect @ $uri)"
+}
+
+list_extra_bindings() {
+  echo
+  if [[ -z "${EXTRA_BINDINGS:-}" ]]; then
+    dim "  (none)"
+    return
+  fi
+  echo -e "${BOLD}Extra bindings:${RESET}"
+  local IFS=';'
+  for b in $EXTRA_BINDINGS; do
+    local name="${b%%:*}"
+    local rest="${b#*:}"
+    local dialect="${rest%%:*}"
+    local uri="${rest#*:}"
+    echo -e "  ${CYAN}$name${RESET} → ${MAGENTA}$dialect${RESET} @ ${DIM}$uri${RESET}"
+  done
+}
+
+# Export a .env.local file compatible with @mostajs/orm convention
+export_env_local() {
+  local target="$PROJECT_ROOT/.env.mostajs"
+  cat > "$target" <<EOF
+# Generated by @mostajs/orm-cli on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Primary database
+DB_DIALECT=${DB_DIALECT:-sqlite}
+SGBD_URI=${SGBD_URI:-./data.sqlite}
+DB_SCHEMA_STRATEGY=${DB_SCHEMA_STRATEGY:-update}
+DB_POOL_SIZE=${DB_POOL_SIZE:-20}
+DB_SHOW_SQL=${DB_SHOW_SQL:-false}
+
+# mosta-net server
+MOSTA_NET_URL=${MOSTA_NET_URL:-http://localhost:14488}
+MOSTA_NET_TRANSPORT=${MOSTA_NET_TRANSPORT:-rest}
+
+# App
+APP_PORT=${APP_PORT:-3000}
+
+# Extra bindings for Prisma Bridge (hybrid apps)
+# Format: EXTRA_BINDINGS="ModelName:dialect:uri;OtherModel:dialect:uri"
+EXTRA_BINDINGS=${EXTRA_BINDINGS:-}
+EOF
+  ok "Exported : $target"
+  info "Review, rename to .env.local, and commit to your .env.example (without secrets)"
+}
+
+# Auto-detect mosta-orm dialect from URI scheme
+detect_dialect_from_uri() {
+  local uri="$1"
+  case "$uri" in
+    mongodb://*|mongodb+srv://*) echo "mongodb" ;;
+    postgres://*|postgresql://*) echo "postgres" ;;
+    mysql://*)                   echo "mysql" ;;
+    mariadb://*)                 echo "mariadb" ;;
+    mssql://*|sqlserver://*)     echo "mssql" ;;
+    oracle://*)                  echo "oracle" ;;
+    db2://*)                     echo "db2" ;;
+    hana://*)                    echo "hana" ;;
+    cockroachdb://*)             echo "cockroachdb" ;;
+    spanner://*)                 echo "spanner" ;;
+    sybase://*)                  echo "sybase" ;;
+    sqlite://*|sqlite:*|*.sqlite|*.db|:memory:) echo "sqlite" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+# Strip scheme prefix from URI (used for SQLite path)
+strip_uri_scheme() {
+  local uri="$1"
+  case "$uri" in
+    sqlite://*) echo "${uri#sqlite://}" ;;
+    sqlite:*)   echo "${uri#sqlite:}"   ;;
+    *)          echo "$uri" ;;
+  esac
+}
+
 action_test_connections() {
   header
-  echo -e "${BOLD}${MAGENTA}▶ Testing connections${RESET}"
+  echo -e "${BOLD}${MAGENTA}▶ Testing connections (via @mostajs/orm)${RESET}"
   echo
   load_env
-  local tested=0
 
-  if [[ -n "${MONGODB_URI:-}" ]]; then
-    info "MongoDB : $MONGODB_URI"
-    if command -v mongosh >/dev/null 2>&1; then
-      echo "db.stats()" | mongosh "$MONGODB_URI" --quiet >/dev/null 2>&1 && ok "reachable" || err "failed"
-    else warn "mongosh not installed"; fi
-    tested=$((tested+1))
+  # Collect all configured URIs as (dialect, uri) pairs
+  local -a pairs=()
+
+  # Primary DB
+  if [[ -n "${DB_DIALECT:-}" && -n "${SGBD_URI:-}" ]]; then
+    pairs+=("${DB_DIALECT}|${SGBD_URI}")
   fi
 
-  for pair in "POSTGRES_URI:psql" "MYSQL_URI:mysql" "MSSQL_URI:sqlcmd" "ORACLE_URI:sqlplus"; do
-    local var="${pair%%:*}"
-    local tool="${pair##*:}"
-    local uri="${!var:-}"
-    [[ -z "$uri" ]] && continue
-    info "$var : $uri"
-    if command -v "$tool" >/dev/null 2>&1; then
-      case "$tool" in
-        psql)   psql "$uri" -c "SELECT 1" >/dev/null 2>&1 && ok reachable || err failed;;
-        mysql)  mysql --defaults-file="/dev/null" -e "SELECT 1" >/dev/null 2>&1 && ok reachable || warn "manual test needed";;
-        *)      warn "tested via tool $tool — manual check";;
-      esac
-    else warn "$tool not installed"; fi
-    tested=$((tested+1))
+  # Extra bindings (format: name:dialect:uri;name:dialect:uri)
+  if [[ -n "${EXTRA_BINDINGS:-}" ]]; then
+    local IFS=';'
+    for b in $EXTRA_BINDINGS; do
+      local rest="${b#*:}"       # strip name
+      local dialect="${rest%%:*}"
+      local uri="${rest#*:}"
+      pairs+=("$dialect|$uri")
+    done
+    IFS=$' \t\n'
+  fi
+
+  if [[ ${#pairs[@]} -eq 0 ]]; then
+    warn "No URIs configured. Go to menu 2 first."
+    pause; return
+  fi
+
+  # Ensure @mostajs/orm is installed (test uses its native testConnection)
+  info "Checking @mostajs/orm installation..."
+  if ! ensure_pkg "@mostajs/orm"; then
+    err "Cannot test connections without @mostajs/orm"
+    pause; return
+  fi
+
+  # Ensure drivers for each dialect being tested
+  info "Checking drivers..."
+  for p in "${pairs[@]}"; do
+    local d="${p%%|*}"
+    ensure_dialect_driver "$d" || warn "Driver for $d may be missing"
   done
 
-  [[ $tested -eq 0 ]] && warn "No URIs configured"
+  local orm_path
+  orm_path=$(resolve_pkg_path "@mostajs/orm") || {
+    err "Cannot resolve @mostajs/orm"
+    pause; return
+  }
+
+  # Build a small node script that tests each connection
+  local -a args=()
+  for p in "${pairs[@]}"; do
+    args+=("$p")
+  done
+
+  cat > "$CONFIG_DIR/test-connections.mjs" <<EOF
+import { getDialect } from '$orm_path';
+
+const pairs = process.argv.slice(2).map(s => {
+  const i = s.indexOf('|');
+  return [s.slice(0, i), s.slice(i + 1)];
+});
+
+function stripScheme(uri) {
+  if (uri.startsWith('sqlite://')) return uri.slice(9);
+  if (uri.startsWith('sqlite:'))   return uri.slice(7);
+  return uri;
+}
+
+let ok = 0, fail = 0;
+for (const [dialect, rawUri] of pairs) {
+  const uri = dialect === 'sqlite' ? stripScheme(rawUri) : rawUri;
+  process.stdout.write(dialect.padEnd(12) + ' ' + rawUri + '\n');
+  try {
+    const d = await getDialect({ dialect, uri });
+    const alive = await d.testConnection();
+    if (alive) {
+      console.log('  \u2713 reachable');
+      ok++;
+    } else {
+      console.log('  \u2717 testConnection returned false');
+      fail++;
+    }
+    await d.disconnect().catch(() => {});
+  } catch (e) {
+    console.error('  \u2717 ' + (e.message ?? e));
+    if (e.code) console.error('    code : ' + e.code);
+    fail++;
+  }
+}
+console.log();
+console.log('Results : ' + ok + ' reachable, ' + fail + ' failed');
+process.exit(fail > 0 ? 1 : 0);
+EOF
+
+  cd "$PROJECT_ROOT"
+  node "$CONFIG_DIR/test-connections.mjs" "${args[@]}" 2>&1 | tee "$LOG_DIR/test-connections.log"
+  echo
   pause
 }
 
@@ -445,46 +802,139 @@ action_init_dialects() {
     pause; return
   fi
 
-  info "Will attempt to initialize dialects for these URIs:"
-  local any=0
-  for var in MONGODB_URI POSTGRES_URI MYSQL_URI SQLITE_URI ORACLE_URI MSSQL_URI DB2_URI; do
-    local val="${!var:-}"
-    [[ -n "$val" ]] && { dim "  $var = $val"; any=1; }
+  # Collect configured dialects from DB_DIALECT/SGBD_URI + EXTRA_BINDINGS
+  local -a configured=()
+  local -a dialect_names=()
+
+  if [[ -n "${DB_DIALECT:-}" && -n "${SGBD_URI:-}" ]]; then
+    configured+=("${DB_DIALECT}:${SGBD_URI}")
+    dialect_names+=("$DB_DIALECT")
+  fi
+
+  if [[ -n "${EXTRA_BINDINGS:-}" ]]; then
+    local IFS=';'
+    for b in $EXTRA_BINDINGS; do
+      local rest="${b#*:}"
+      local dialect="${rest%%:*}"
+      local uri="${rest#*:}"
+      configured+=("${dialect}:${uri}")
+      dialect_names+=("$dialect")
+    done
+    IFS=$' \t\n'
+  fi
+
+  if [[ ${#configured[@]} -eq 0 ]]; then
+    err "No URIs set. Menu 2 first."
+    pause; return
+  fi
+
+  info "Will attempt to initialize:"
+  for item in "${configured[@]}"; do
+    dim "  ${item%%:*} → ${item#*:}"
   done
-  [[ $any -eq 0 ]] && { err "No URIs set. Menu 2 first."; pause; return; }
+  echo
 
   confirm "Proceed?" || return
 
-  cat > "$CONFIG_DIR/init-all.mjs" << 'EOF'
+  # ---- Step 1 : ensure @mostajs/orm is installed ----
+  info "Step 1/3 : checking @mostajs/orm installation..."
+  if ! ensure_pkg "@mostajs/orm"; then
+    err "Cannot initialize dialects without @mostajs/orm"
+    pause; return
+  fi
+  ok "@mostajs/orm available"
+
+  # ---- Step 2 : ensure drivers for each dialect are installed ----
+  info "Step 2/3 : checking dialect drivers..."
+  for dialect in "${dialect_names[@]}"; do
+    ensure_dialect_driver "$dialect" || warn "Driver for $dialect may be missing"
+  done
+  ok "Drivers checked"
+
+  # ---- Step 3 : resolve absolute path to @mostajs/orm (avoids import resolution issues) ----
+  local orm_path
+  orm_path=$(resolve_pkg_path "@mostajs/orm") || {
+    err "Could not resolve @mostajs/orm path even after install"
+    pause; return
+  }
+  dim "Using @mostajs/orm at : $orm_path"
+  echo
+
+  # Pass each dialect:uri pair as argv to the node script
+  cat > "$CONFIG_DIR/init-all.mjs" <<EOF
+// Auto-generated by mostajs-cli — runs from project root
 import { readFileSync } from 'fs';
-import { getDialect } from '@mostajs/orm';
-import { entities } from './generated/entities.js';
+import { getDialect } from '$orm_path';
 
-const dialects = [
-  ['mongodb',  process.env.MONGODB_URI],
-  ['postgres', process.env.POSTGRES_URI],
-  ['mysql',    process.env.MYSQL_URI],
-  ['sqlite',   process.env.SQLITE_URI],
-  ['oracle',   process.env.ORACLE_URI],
-  ['mssql',    process.env.MSSQL_URI],
-  ['db2',      process.env.DB2_URI],
-];
+let entities;
+try {
+  entities = JSON.parse(readFileSync('$GENERATED_DIR/entities.json', 'utf8'));
+} catch (e) {
+  console.error('Cannot load entities.json — run menu 1 (Convert) first.');
+  console.error('Reason : ' + e.message);
+  process.exit(1);
+}
 
-for (const [dialect, uri] of dialects) {
-  if (!uri) continue;
-  console.log(`\n\u2192 ${dialect} : ${uri}`);
+function stripScheme(uri) {
+  if (uri.startsWith('sqlite://')) return uri.slice(9);
+  if (uri.startsWith('sqlite:'))   return uri.slice(7);
+  return uri;
+}
+
+const pairs = process.argv.slice(2).map(s => {
+  const i = s.indexOf('|');
+  return [s.slice(0, i), s.slice(i + 1)];
+});
+
+let ok = 0, fail = 0;
+const schemaStrategy = process.env.DB_SCHEMA_STRATEGY ?? 'update';
+const poolSize = parseInt(process.env.DB_POOL_SIZE ?? '20', 10);
+const showSql = process.env.DB_SHOW_SQL === 'true';
+
+for (const [dialect, rawUri] of pairs) {
+  const uri = dialect === 'sqlite' ? stripScheme(rawUri) : rawUri;
+  process.stdout.write('→ ' + dialect.padEnd(12) + ' : ' + rawUri + '\n');
   try {
-    const d = await getDialect({ dialect, uri, schemaStrategy: 'update' });
+    const d = await getDialect({ dialect, uri, schemaStrategy, poolSize, showSql });
     await d.initSchema(entities);
-    console.log(`  \u2713 ${dialect} ready (${entities.length} entities)`);
-    await d.disconnect();
+    console.log('  ✓ ' + dialect + ' ready (' + entities.length + ' entities)');
+    await d.disconnect().catch(() => {});
+    ok++;
   } catch (e) {
-    console.error(`  \u2717 ${dialect} failed : ${e.message}`);
+    console.error('  ✗ ' + dialect + ' failed : ' + (e.message ?? e));
+    if (e.code) console.error('    code : ' + e.code);
+    fail++;
   }
 }
+console.log();
+console.log('Summary : ' + ok + ' succeeded, ' + fail + ' failed');
+process.exit(fail > 0 ? 1 : 0);
 EOF
-  cd "$PROJECT_ROOT"
-  node "$CONFIG_DIR/init-all.mjs" 2>&1 | tee "$LOG_DIR/init.log"
+
+  info "Step 3/3 : running initialization..."
+  cd "$PROJECT_ROOT" || return
+
+  # Pass each dialect:uri as an argv pair
+  local -a args=()
+  for item in "${configured[@]}"; do
+    local d="${item%%:*}"
+    local u="${item#*:}"
+    args+=("$d|$u")
+  done
+
+  if node "$CONFIG_DIR/init-all.mjs" "${args[@]}" 2>&1 | tee "$LOG_DIR/init.log"; then
+    echo
+    ok "Initialization complete"
+  else
+    echo
+    warn "One or more dialects failed — check the log above"
+    info "Log : $LOG_DIR/init.log"
+    echo
+    info "Common fixes :"
+    dim "  - Verify the URI in menu 2 is reachable (menu 2 → T)"
+    dim "  - Install missing driver : $PKG_MANAGER install <driver>"
+    dim "  - Oracle/DB2/HANA need native libs installed on your system"
+  fi
   pause
 }
 
@@ -587,20 +1037,52 @@ action_curl_test() {
   header
   echo -e "${BOLD}${MAGENTA}▶ curl smoke test${RESET}"
   echo
+
+  if ! command -v curl >/dev/null 2>&1; then
+    err "curl is not installed"
+    info "Install with : sudo apt install curl"
+    return 1
+  fi
+
+  local any_reachable=0
   for url in \
     "http://localhost:${APP_PORT:-3000}/" \
     "http://localhost:${APP_PORT:-3000}/api/health" \
     "http://localhost:${MOSTA_NET_PORT:-4447}/" \
     "http://localhost:${MOSTA_NET_PORT:-4447}/mcp"; do
     info "GET $url"
-    curl -s -o /dev/null -w "    status=%{http_code}  time=%{time_total}s\n" --max-time 5 "$url" 2>/dev/null || err "failed"
+    local output
+    output=$(curl -s -o /dev/null -w "    status=%{http_code}  time=%{time_total}s" --max-time 5 "$url" 2>&1)
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+      echo "$output"
+      any_reachable=1
+    else
+      err "    unreachable (curl exit $rc — check service is running)"
+    fi
   done
+  [[ $any_reachable -eq 0 ]] && {
+    echo
+    warn "No endpoints reachable. Start services first (menu 5)."
+  }
 }
 
 run_in_project() {
-  cd "$PROJECT_ROOT"
-  info "Running: $1"
-  eval "$1"
+  local cmd="$1"
+  cd "$PROJECT_ROOT" || { err "Cannot cd to project root"; return 1; }
+  info "Running: $cmd"
+  set +e
+  eval "$cmd"
+  local rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    err "Command exited with code $rc"
+    info "Check the output above, or common issues :"
+    dim "  - Tests failing → fix them, or skip with a flag"
+    dim "  - 'command not found' → install missing dev tools"
+    dim "  - Port conflict → stop other services first (menu 5 → 3)"
+  fi
+  return $rc
 }
 
 # ============================================================
@@ -981,6 +1463,10 @@ EOF
 # ============================================================
 # MAIN
 # ============================================================
+
+# If this script is being *sourced*, stop here — don't start the menu.
+# This lets other scripts (e.g. tests) reuse helper functions.
+[[ "${BASH_SOURCE[0]}" != "${0}" ]] && return 0 2>/dev/null
 
 # Non-interactive mode if args provided
 if [[ $# -gt 0 ]]; then
