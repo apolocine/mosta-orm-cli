@@ -1,0 +1,6 @@
+.gitignore
+.npmignore
+install.sh
+docs/
+*.log
+.mostajs/

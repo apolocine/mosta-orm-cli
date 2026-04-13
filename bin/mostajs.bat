@@ -1,0 +1,490 @@
+@echo off
+:: mostajs.bat — Universal interactive CLI for @mostajs/orm integration (Windows)
+:: Author: Dr Hamid MADANI drmdh@msn.com
+:: License: AGPL-3.0-or-later
+
+setlocal enabledelayedexpansion
+
+set "CLI_VERSION=0.1.0"
+set "PROJECT_ROOT=%cd%"
+set "CONFIG_DIR=%PROJECT_ROOT%\.mostajs"
+set "CONFIG_FILE=%CONFIG_DIR%\config.env"
+set "LOG_DIR=%CONFIG_DIR%\logs"
+set "GENERATED_DIR=%CONFIG_DIR%\generated"
+
+if not exist "%CONFIG_DIR%" mkdir "%CONFIG_DIR%"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+if not exist "%GENERATED_DIR%" mkdir "%GENERATED_DIR%"
+
+:: ---------- CLI subcommands ----------
+if "%~1"=="" goto INTERACTIVE
+if /i "%~1"=="convert" goto SUB_CONVERT
+if /i "%~1"=="detect"  goto SUB_DETECT
+if /i "%~1"=="health"  goto ACTION_HEALTH
+if /i "%~1"=="version" (echo mostajs %CLI_VERSION% & exit /b 0)
+if /i "%~1"=="help"    goto SHOW_HELP
+echo Unknown command: %~1
+exit /b 1
+
+:SHOW_HELP
+echo.
+echo Usage:
+echo   mostajs                 Interactive menu
+echo   mostajs convert         Run conversion
+echo   mostajs detect          Print detected schemas
+echo   mostajs health          Run health checks
+echo   mostajs version         Print version
+exit /b 0
+
+:INTERACTIVE
+
+:MAIN_MENU
+cls
+call :LOAD_ENV
+call :DETECT_PROJECT
+echo ============================================================
+echo    @mostajs/orm-cli v%CLI_VERSION% - Universal Schema Adapter
+echo ============================================================
+echo.
+echo Project : %PROJECT_ROOT%
+echo Manager : %PKG_MANAGER%
+echo Detected:
+if defined PRISMA_SCHEMA echo    [OK] Prisma : !PRISMA_MODELS! models
+if defined OPENAPI_FILE  echo    [OK] OpenAPI : !OPENAPI_FILE!
+if exist "%GENERATED_DIR%\entities.ts" (
+    echo    [OK] entities.ts generated
+) else (
+    echo    [!!] entities.ts not generated
+)
+echo.
+echo ----- MAIN MENU -----
+echo   1) Convert schema
+echo   2) Configure database URIs
+echo   3) Initialize dialects
+echo   4) Tests menu
+echo   5) Start services
+echo   6) Metrics
+echo   7) View logs
+echo   8) Health checks
+echo   9) Generate boilerplate
+echo   0) About
+echo   Q) Quit
+echo.
+set /p "choice=Choice [1]: "
+if "%choice%"=="" set "choice=1"
+
+if /i "%choice%"=="1" goto ACTION_CONVERT
+if /i "%choice%"=="2" goto MENU_DB
+if /i "%choice%"=="3" goto ACTION_INIT
+if /i "%choice%"=="4" goto MENU_TESTS
+if /i "%choice%"=="5" goto MENU_SERVICES
+if /i "%choice%"=="6" goto ACTION_METRICS
+if /i "%choice%"=="7" goto ACTION_LOGS
+if /i "%choice%"=="8" goto ACTION_HEALTH
+if /i "%choice%"=="9" goto ACTION_BOILERPLATE
+if /i "%choice%"=="0" goto ACTION_ABOUT
+if /i "%choice%"=="q" goto END
+goto MAIN_MENU
+
+:: ============================================================
+:: DETECT PROJECT
+:: ============================================================
+:DETECT_PROJECT
+set "PRISMA_SCHEMA="
+set "OPENAPI_FILE="
+set "PRISMA_MODELS=0"
+set "PKG_MANAGER=npm"
+if exist "%PROJECT_ROOT%\pnpm-lock.yaml" set "PKG_MANAGER=pnpm"
+if exist "%PROJECT_ROOT%\yarn.lock"      set "PKG_MANAGER=yarn"
+if exist "%PROJECT_ROOT%\prisma\schema.prisma" (
+    set "PRISMA_SCHEMA=%PROJECT_ROOT%\prisma\schema.prisma"
+    for /f %%A in ('findstr /c:"^model " "!PRISMA_SCHEMA!" 2^>nul ^| find /c /v ""') do set "PRISMA_MODELS=%%A"
+)
+for %%F in (openapi.yaml openapi.yml openapi.json api.yaml api.json) do (
+    if exist "%PROJECT_ROOT%\%%F" set "OPENAPI_FILE=%PROJECT_ROOT%\%%F"
+)
+exit /b 0
+
+:: ============================================================
+:: CONVERT
+:: ============================================================
+:ACTION_CONVERT
+cls
+call :DETECT_PROJECT
+echo Converting schema -^> entities.ts
+echo.
+if defined PRISMA_SCHEMA (
+    set "INPUT_FILE=!PRISMA_SCHEMA!"
+    set "ADAPTER=PrismaAdapter"
+    set "IS_JSON=false"
+) else if defined OPENAPI_FILE (
+    set "INPUT_FILE=!OPENAPI_FILE!"
+    set "ADAPTER=OpenApiAdapter"
+    set "IS_JSON=false"
+) else (
+    echo [ERR] No schema detected.
+    pause
+    goto MAIN_MENU
+)
+echo Source  : !INPUT_FILE!
+echo Output  : %GENERATED_DIR%\entities.ts
+echo Adapter : !ADAPTER!
+echo.
+
+:: Check adapter installed
+set "ADAPTER_PATH=%PROJECT_ROOT%\node_modules\@mostajs\orm-adapter\dist\index.js"
+if not exist "!ADAPTER_PATH!" (
+    echo [!!] @mostajs/orm-adapter not installed in this project.
+    set /p "doit=Install now? [y/N]: "
+    if /i "!doit!"=="y" (
+        cd /d "%PROJECT_ROOT%"
+        call %PKG_MANAGER% install --save-dev @mostajs/orm-adapter @mostajs/orm
+    ) else (
+        pause
+        goto MAIN_MENU
+    )
+)
+
+node --input-type=module -e "import { readFileSync, writeFileSync } from 'fs'; import { !ADAPTER! } from '%PROJECT_ROOT%/node_modules/@mostajs/orm-adapter/dist/index.js'; const src = readFileSync('!INPUT_FILE!','utf8'); const input = '!IS_JSON!' === 'true' ? JSON.parse(src) : src; const w=[]; const e = await new !ADAPTER!().toEntitySchema(input,{onWarning:x=>w.push(x)}); console.log('entities:', e.length, 'warnings:', w.length); writeFileSync('%GENERATED_DIR%/entities.ts','// Auto-generated by @mostajs/orm-cli v%CLI_VERSION%\nimport type { EntitySchema } from \"@mostajs/orm\";\nexport const entities: EntitySchema[] = '+JSON.stringify(e,null,2)+';\nexport const entityByName = Object.fromEntries(entities.map(x=>[x.name,x]));\n');" > "%LOG_DIR%\convert.log" 2>&1
+type "%LOG_DIR%\convert.log"
+pause
+goto MAIN_MENU
+
+:SUB_CONVERT
+call :DETECT_PROJECT
+goto ACTION_CONVERT
+
+:SUB_DETECT
+call :DETECT_PROJECT
+echo project : %PROJECT_ROOT%
+echo manager : %PKG_MANAGER%
+if defined PRISMA_SCHEMA echo prisma  : %PRISMA_SCHEMA% (%PRISMA_MODELS% models)
+if defined OPENAPI_FILE  echo openapi : %OPENAPI_FILE%
+exit /b 0
+
+:: ============================================================
+:: MENU 2 : DATABASES
+:: ============================================================
+:MENU_DB
+cls
+call :LOAD_ENV
+echo ==== Database configuration ====
+echo   1) MongoDB        : %MONGODB_URI%
+echo   2) PostgreSQL     : %POSTGRES_URI%
+echo   3) MySQL/MariaDB  : %MYSQL_URI%
+echo   4) SQLite         : %SQLITE_URI%
+echo   5) Oracle         : %ORACLE_URI%
+echo   6) MSSQL          : %MSSQL_URI%
+echo   7) DB2            : %DB2_URI%
+echo   P) App port       : %APP_PORT%
+echo   N) mosta-net port : %MOSTA_NET_PORT%
+echo   R) Reset config
+echo   B) Back
+echo.
+set /p "choice=Choice: "
+if /i "%choice%"=="1" set /p "v=MongoDB URI: " & call :SAVE_ENV MONGODB_URI "!v!" & goto MENU_DB
+if /i "%choice%"=="2" set /p "v=PostgreSQL URI: " & call :SAVE_ENV POSTGRES_URI "!v!" & goto MENU_DB
+if /i "%choice%"=="3" set /p "v=MySQL URI: " & call :SAVE_ENV MYSQL_URI "!v!" & goto MENU_DB
+if /i "%choice%"=="4" set /p "v=SQLite path: " & call :SAVE_ENV SQLITE_URI "!v!" & goto MENU_DB
+if /i "%choice%"=="5" set /p "v=Oracle URI: " & call :SAVE_ENV ORACLE_URI "!v!" & goto MENU_DB
+if /i "%choice%"=="6" set /p "v=MSSQL URI: " & call :SAVE_ENV MSSQL_URI "!v!" & goto MENU_DB
+if /i "%choice%"=="7" set /p "v=DB2 URI: " & call :SAVE_ENV DB2_URI "!v!" & goto MENU_DB
+if /i "%choice%"=="p" set /p "v=App port: " & call :SAVE_ENV APP_PORT "!v!" & goto MENU_DB
+if /i "%choice%"=="n" set /p "v=mosta-net port: " & call :SAVE_ENV MOSTA_NET_PORT "!v!" & goto MENU_DB
+if /i "%choice%"=="r" del "%CONFIG_FILE%" 2>nul & goto MENU_DB
+if /i "%choice%"=="b" goto MAIN_MENU
+goto MENU_DB
+
+:: ============================================================
+:: ACTION 3 : INIT
+:: ============================================================
+:ACTION_INIT
+cls
+call :LOAD_ENV
+if not exist "%GENERATED_DIR%\entities.ts" (
+    echo [ERR] Run conversion (menu 1) first.
+    pause
+    goto MAIN_MENU
+)
+echo Will initialize dialects for:
+if defined MONGODB_URI  echo   - mongodb
+if defined POSTGRES_URI echo   - postgres
+if defined MYSQL_URI    echo   - mysql
+if defined SQLITE_URI   echo   - sqlite
+if defined ORACLE_URI   echo   - oracle
+echo.
+set /p "go=Proceed? [y/N]: "
+if /i not "!go!"=="y" goto MAIN_MENU
+node "%GENERATED_DIR%\..\init-all.mjs" > "%LOG_DIR%\init.log" 2>&1
+type "%LOG_DIR%\init.log"
+pause
+goto MAIN_MENU
+
+:: ============================================================
+:: MENU 4 : TESTS
+:: ============================================================
+:MENU_TESTS
+cls
+call :LOAD_ENV
+echo ==== Tests menu ====
+echo   1) Open app in browser
+echo   2) Open mosta-net dashboard
+echo   3) Mobile URL (QR if qrencode installed)
+echo   4) MCP endpoint config (Claude/GPT)
+echo   5) curl smoke test
+echo   6) Playwright
+echo   B) Back
+echo.
+set /p "choice=Choice [1]: "
+if "%choice%"=="" set "choice=1"
+if /i "%choice%"=="1" start "" "http://localhost:%APP_PORT%" & goto MENU_TESTS
+if /i "%choice%"=="2" start "" "http://localhost:%MOSTA_NET_PORT%" & goto MENU_TESTS
+if /i "%choice%"=="3" goto ACTION_QR
+if /i "%choice%"=="4" goto ACTION_MCP
+if /i "%choice%"=="5" goto ACTION_CURL
+if /i "%choice%"=="6" cd /d "%PROJECT_ROOT%" & call npx playwright test & pause & goto MENU_TESTS
+if /i "%choice%"=="b" goto MAIN_MENU
+goto MENU_TESTS
+
+:ACTION_QR
+cls
+for /f "tokens=14" %%A in ('ipconfig ^| findstr /i "IPv4" ^| findstr /v "169.254"') do set "LOCAL_IP=%%A"
+if not defined LOCAL_IP set "LOCAL_IP=localhost"
+set "URL=http://!LOCAL_IP!:%APP_PORT%"
+echo Mobile URL : !URL!
+echo.
+where qrencode >nul 2>nul
+if not errorlevel 1 (qrencode -t ANSIUTF8 "!URL!") else (echo Install qrencode for QR generation)
+pause
+goto MENU_TESTS
+
+:ACTION_MCP
+cls
+set "MCP_URL=http://localhost:%MOSTA_NET_PORT%/mcp"
+echo MCP endpoint : !MCP_URL!
+echo.
+echo Claude Desktop config:
+echo {
+echo   "mcpServers": {
+for %%A in ("%PROJECT_ROOT%") do echo     "%%~nA": { "url": "!MCP_URL!" }
+echo   }
+echo }
+pause
+goto MENU_TESTS
+
+:ACTION_CURL
+cls
+for %%U in ("http://localhost:%APP_PORT%/" "http://localhost:%APP_PORT%/api/health" "http://localhost:%MOSTA_NET_PORT%/" "http://localhost:%MOSTA_NET_PORT%/mcp") do (
+    echo GET %%~U
+    curl -s -o nul -w "  status=%%{http_code}  time=%%{time_total}s\n" --max-time 5 %%U
+)
+pause
+goto MENU_TESTS
+
+:: ============================================================
+:: MENU 5 : SERVICES
+:: ============================================================
+:MENU_SERVICES
+cls
+call :LOAD_ENV
+echo ==== Services ====
+echo   1) Start dev server (new window)
+echo   2) Show URLs
+echo   B) Back
+echo.
+set /p "choice=Choice [1]: "
+if "%choice%"=="" set "choice=1"
+if /i "%choice%"=="1" (
+    cd /d "%PROJECT_ROOT%"
+    start "dev" cmd /k "%PKG_MANAGER% run dev"
+    call :SHOW_URLS
+    pause
+    goto MENU_SERVICES
+)
+if /i "%choice%"=="2" call :SHOW_URLS & pause & goto MENU_SERVICES
+if /i "%choice%"=="b" goto MAIN_MENU
+goto MENU_SERVICES
+
+:SHOW_URLS
+echo.
+echo Access URLs:
+echo   App (local)       : http://localhost:%APP_PORT%
+echo   mosta-net         : http://localhost:%MOSTA_NET_PORT%
+echo   MCP endpoint (AI) : http://localhost:%MOSTA_NET_PORT%/mcp
+exit /b 0
+
+:: ============================================================
+:: ACTION 6 : METRICS
+:: ============================================================
+:ACTION_METRICS
+cls
+call :DETECT_PROJECT
+echo ==== Metrics ====
+if defined PRISMA_SCHEMA echo Prisma models  : !PRISMA_MODELS!
+if exist "%GENERATED_DIR%\entities.ts" (
+    for %%A in ("%GENERATED_DIR%\entities.ts") do echo entities.ts    : %%~zA bytes
+)
+pause
+goto MAIN_MENU
+
+:: ============================================================
+:: ACTION 7 : LOGS
+:: ============================================================
+:ACTION_LOGS
+cls
+echo ==== Logs ====
+set "i=0"
+for %%A in ("%LOG_DIR%\*.log") do (
+    set /a "i+=1"
+    echo   !i!^) %%~nxA
+    set "LOG_!i!=%%A"
+)
+if %i%==0 (echo No logs yet & pause & goto MAIN_MENU)
+set /p "c=File #: "
+if defined LOG_%c% (call set "F=%%LOG_%c%%%" & type "!F!")
+pause
+goto MAIN_MENU
+
+:: ============================================================
+:: ACTION 8 : HEALTH
+:: ============================================================
+:ACTION_HEALTH
+cls
+call :DETECT_PROJECT
+echo ==== Health checks ====
+where node >nul 2>nul && (echo [OK] node) || (echo [ERR] node missing)
+where %PKG_MANAGER% >nul 2>nul && (echo [OK] %PKG_MANAGER%) || (echo [ERR] %PKG_MANAGER% missing)
+if exist "%PROJECT_ROOT%\package.json" (echo [OK] package.json) else (echo [!!] package.json missing)
+if defined PRISMA_SCHEMA (echo [OK] Prisma schema ^(!PRISMA_MODELS! models^)) else (echo [!!] no Prisma schema)
+if defined OPENAPI_FILE (echo [OK] OpenAPI file) else (echo [!!] no OpenAPI)
+if exist "%GENERATED_DIR%\entities.ts" (echo [OK] entities generated) else (echo [!!] not generated)
+where curl >nul 2>nul && (echo [OK] curl) || (echo [!!] curl missing)
+where qrencode >nul 2>nul && (echo [OK] qrencode) || (echo [!!] qrencode optional - missing)
+pause
+goto MAIN_MENU
+
+:: ============================================================
+:: ACTION 9 : BOILERPLATE
+:: ============================================================
+:ACTION_BOILERPLATE
+cls
+echo ==== Boilerplate ====
+echo   1) src\db.ts (Prisma bridge wrapper)
+echo   2) src\mosta-orm.ts (direct usage)
+echo   3) .env.example
+echo.
+set /p "c=Choice [1]: "
+if "%c%"=="" set "c=1"
+if "%c%"=="1" goto GEN_BRIDGE
+if "%c%"=="2" goto GEN_DIRECT
+if "%c%"=="3" goto GEN_ENV
+goto MAIN_MENU
+
+:GEN_BRIDGE
+if not exist "%PROJECT_ROOT%\src" mkdir "%PROJECT_ROOT%\src"
+(
+echo // Auto-generated by @mostajs/orm-cli
+echo import { PrismaClient } from '@prisma/client';
+echo import { mostaExtension } from '@mostajs/orm-bridge/prisma';
+echo import { entityByName } from '../.mostajs/generated/entities.js';
+echo.
+echo export const prisma = new PrismaClient^(^).$extends^(mostaExtension^({
+echo   models: {
+echo     // AuditLog: { dialect: 'mongodb', url: process.env.MONGODB_URI!, schema: entityByName.AuditLog },
+echo   },
+echo   fallback: 'source',
+echo }^)^);
+) > "%PROJECT_ROOT%\src\db.ts"
+echo [OK] Written src\db.ts
+pause
+goto MAIN_MENU
+
+:GEN_DIRECT
+if not exist "%PROJECT_ROOT%\src" mkdir "%PROJECT_ROOT%\src"
+(
+echo // Auto-generated by @mostajs/orm-cli
+echo import { getDialect } from '@mostajs/orm';
+echo import { entities } from '../.mostajs/generated/entities.js';
+echo.
+echo export async function createOrm^(^) {
+echo   const dialect = await getDialect^({ dialect: 'postgres', uri: process.env.DATABASE_URL! }^);
+echo   await dialect.initSchema^(entities^);
+echo   return { dialect, entities };
+echo }
+) > "%PROJECT_ROOT%\src\mosta-orm.ts"
+echo [OK] Written src\mosta-orm.ts
+pause
+goto MAIN_MENU
+
+:GEN_ENV
+(
+echo MONGODB_URI=mongodb://localhost:27017/app
+echo POSTGRES_URI=postgres://user:pw@localhost:5432/app
+echo MYSQL_URI=mysql://user:pw@localhost:3306/app
+echo APP_PORT=3000
+echo MOSTA_NET_PORT=4447
+) > "%PROJECT_ROOT%\.env.example"
+echo [OK] Written .env.example
+pause
+goto MAIN_MENU
+
+:: ============================================================
+:: ACTION 0 : ABOUT
+:: ============================================================
+:ACTION_ABOUT
+cls
+echo ============================================================
+echo   mostajs-cli v%CLI_VERSION%
+echo ============================================================
+echo.
+echo   Convert schemas to @mostajs/orm EntitySchema[]
+echo   Gain access to 13 databases without rewriting code.
+echo.
+echo   Inputs  : Prisma, OpenAPI, JSON Schema
+echo   DBs     : PostgreSQL, MySQL, MariaDB, SQLite, MSSQL, Oracle,
+echo             DB2, CockroachDB, HANA, HSQLDB, Spanner, Sybase, MongoDB
+echo.
+echo   Packages:
+echo     @mostajs/orm
+echo     @mostajs/orm-adapter
+echo     @mostajs/orm-bridge
+echo.
+echo   Author  : Dr Hamid MADANI ^<drmdh@msn.com^>
+echo   License : AGPL-3.0-or-later
+pause
+goto MAIN_MENU
+
+:: ============================================================
+:: HELPERS
+:: ============================================================
+:LOAD_ENV
+set "MONGODB_URI="
+set "POSTGRES_URI="
+set "MYSQL_URI="
+set "SQLITE_URI="
+set "ORACLE_URI="
+set "MSSQL_URI="
+set "DB2_URI="
+set "APP_PORT=3000"
+set "MOSTA_NET_PORT=4447"
+if exist "%CONFIG_FILE%" (
+    for /f "tokens=1,* delims==" %%A in ('type "%CONFIG_FILE%"') do set "%%A=%%B"
+)
+exit /b 0
+
+:SAVE_ENV
+set "KEY=%~1"
+set "VAL=%~2"
+if not exist "%CONFIG_FILE%" (
+    echo %KEY%=%VAL%> "%CONFIG_FILE%"
+) else (
+    findstr /v "^%KEY%=" "%CONFIG_FILE%" > "%CONFIG_FILE%.tmp" 2>nul
+    echo %KEY%=%VAL%>> "%CONFIG_FILE%.tmp"
+    move /y "%CONFIG_FILE%.tmp" "%CONFIG_FILE%" >nul
+)
+echo [OK] Saved %KEY%
+exit /b 0
+
+:END
+endlocal
+exit /b 0

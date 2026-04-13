@@ -1,0 +1,44 @@
+{
+  "name": "@mostajs/orm-cli",
+  "version": "0.1.0",
+  "description": "Universal CLI to integrate @mostajs/orm into any project — auto-detects Prisma, OpenAPI, JSON Schema. Interactive menu + subcommands. 13 databases.",
+  "author": "Dr Hamid MADANI <drmdh@msn.com>",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "bin": {
+    "mostajs": "./bin/mostajs-launcher.cjs"
+  },
+  "files": [
+    "bin",
+    "LICENSE",
+    "README.md"
+  ],
+  "keywords": [
+    "mostajs",
+    "orm",
+    "cli",
+    "prisma",
+    "openapi",
+    "json-schema",
+    "adapter",
+    "multi-database",
+    "schema-conversion",
+    "bridge"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/apolocine/mosta-orm-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/apolocine/mosta-orm-cli/issues"
+  },
+  "homepage": "https://github.com/apolocine/mosta-orm-cli#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "linux",
+    "darwin",
+    "win32"
+  ]
+}
