@@ -437,6 +437,7 @@ menu_main() {
   echo -e "  ${CYAN}7${RESET}) View logs"
   echo -e "  ${CYAN}8${RESET}) Health checks"
   echo -e "  ${CYAN}9${RESET}) Generate boilerplate (src/db.ts with bridge)"
+  echo -e "  ${CYAN}s${RESET}) ${BOLD}Seeding${RESET} (upload / validate / apply seed data)"
   echo -e "  ${CYAN}0${RESET}) About / Help"
   echo
   echo -e "  ${RED}q${RESET}) Quit"
@@ -453,6 +454,7 @@ menu_main() {
     7) action_logs ;;
     8) action_healthcheck ;;
     9) action_generate_boilerplate ;;
+    s|S) menu_seeding ;;
     0) action_about ;;
     q|Q) exit 0 ;;
     *) warn "Unknown choice"; pause ;;
@@ -1365,12 +1367,23 @@ show_urls() {
   load_env
   local ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo localhost)
+
+  # Parse mosta-net URL from config (full URL, not just port)
+  local mosta_url="${MOSTA_NET_URL:-http://localhost:14488}"
+  local mosta_host="${mosta_url#*://}"
+  mosta_host="${mosta_host%%/*}"
+
+  # App URL : derive from APP_PORT
+  local app_port="${APP_PORT:-3000}"
+
   echo
   echo -e "${BOLD}Access URLs${RESET}"
-  echo -e "  Dev server (local)  : ${CYAN}http://localhost:${APP_PORT:-3000}${RESET}"
-  echo -e "  Dev server (mobile) : ${CYAN}http://${ip}:${APP_PORT:-3000}${RESET}"
-  echo -e "  mosta-net           : ${CYAN}http://localhost:${MOSTA_NET_PORT:-4447}${RESET}"
-  echo -e "  MCP endpoint (AI)   : ${CYAN}http://localhost:${MOSTA_NET_PORT:-4447}/mcp${RESET}"
+  echo -e "  Dev server (local)  : ${CYAN}http://localhost:${app_port}${RESET}"
+  echo -e "  Dev server (mobile) : ${CYAN}http://${ip}:${app_port}${RESET}"
+  echo -e "  mosta-net base      : ${CYAN}${mosta_url}${RESET}"
+  echo -e "  REST CRUD           : ${CYAN}${mosta_url}/api/v1/<collection>${RESET}"
+  echo -e "  MCP endpoint (AI)   : ${CYAN}${mosta_url}/mcp${RESET}"
+  echo -e "  LAN (mobile)        : ${CYAN}http://${ip}${mosta_host#localhost}${RESET}"
 }
 
 # ============================================================
@@ -1461,6 +1474,491 @@ action_healthcheck() {
   command -v mongosh >/dev/null 2>&1 && ok "mongosh" || warn "mongosh missing (optional, for mongo tests)"
   command -v psql    >/dev/null 2>&1 && ok "psql" || warn "psql missing (optional, for PG tests)"
   command -v xdg-open >/dev/null 2>&1 || command -v open >/dev/null 2>&1 && ok "browser-opener available" || warn "cannot auto-open URLs"
+  pause
+}
+
+# ============================================================
+# MENU S : SEEDING
+# ============================================================
+
+menu_seeding() {
+  load_env
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Seeding — populate databases with test / initial data${RESET}"
+  echo
+  local seed_dir="$CONFIG_DIR/seeds"
+  mkdir -p "$seed_dir"
+  local count
+  count=$(ls -1 "$seed_dir"/*.json 2>/dev/null | wc -l)
+  echo -e "  Seed directory : ${DIM}${seed_dir}${RESET}"
+  echo -e "  Seed files     : ${DIM}${count} .json${RESET}"
+  [[ $count -gt 0 ]] && ls "$seed_dir"/*.json 2>/dev/null | while read f; do
+    local rows; rows=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('$f','utf8')).length)}catch{console.log('?')}" 2>/dev/null)
+    dim "    - $(basename "$f")  (${rows} rows)"
+  done
+  echo
+  echo -e "${BOLD}━━━ SEEDING MENU ━━━${RESET}"
+  echo
+  echo -e "  ${CYAN}1${RESET}) Upload / import seed file(s)"
+  echo -e "  ${CYAN}2${RESET}) Generate seed templates (one empty .json per entity)"
+  echo -e "  ${CYAN}3${RESET}) Validate seeds against schema (dry-run, no DB writes)"
+  echo -e "  ${CYAN}4${RESET}) Apply seeds to primary DB"
+  echo -e "  ${CYAN}5${RESET}) Apply seeds with upsert (insert or update by id)"
+  echo -e "  ${CYAN}6${RESET}) Truncate + apply (DESTRUCTIVE — wipes tables first)"
+  echo -e "  ${CYAN}7${RESET}) Dump current DB rows → .mostajs/seeds-dump/"
+  echo -e "  ${CYAN}8${RESET}) Clear the seeds directory"
+  echo -e "  ${CYAN}9${RESET}) Show a seed file"
+  echo
+  echo -e "  ${CYAN}b${RESET}) Back"
+  echo
+  local choice
+  choice=$(ask "Choice" "1")
+  case "$choice" in
+    1) action_seed_upload ;;
+    2) action_seed_generate_templates ;;
+    3) action_seed_apply "validate" ;;
+    4) action_seed_apply "apply" ;;
+    5) action_seed_apply "upsert" ;;
+    6) action_seed_apply "truncate-apply" ;;
+    7) action_seed_dump ;;
+    8) action_seed_clear ;;
+    9) action_seed_show ;;
+    b|B) return ;;
+    *) warn "Unknown"; pause ;;
+  esac
+  menu_seeding
+}
+
+# ------------------------------------------------------------
+# seed : upload / import
+# ------------------------------------------------------------
+
+action_seed_upload() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Upload seed file(s)${RESET}"
+  echo
+  local seed_dir="$CONFIG_DIR/seeds"
+  mkdir -p "$seed_dir"
+
+  echo "Supported forms :"
+  dim "  (a) Single file with all collections :   seeds.json  → { users: [...], posts: [...] }"
+  dim "  (b) One file per collection (preferred): seeds/users.json = [...rows...]"
+  dim "  (c) CSV (header row = field names) :     seeds/users.csv"
+  echo
+  local src
+  src=$(ask "Path to seed file or directory (tilde OK)")
+  [[ -z "$src" ]] && return
+  src="${src/#\~/$HOME}"
+  [[ ! -e "$src" ]] && { err "Path does not exist : $src"; pause; return; }
+
+  if [[ -d "$src" ]]; then
+    local n=0
+    for f in "$src"/*.{json,csv}; do
+      [[ -f "$f" ]] || continue
+      cp "$f" "$seed_dir/" && n=$((n+1))
+    done
+    ok "Imported $n file(s) from $src → $seed_dir"
+  elif [[ "$src" =~ \.json$ ]]; then
+    # Case (a) or (b) — detect
+    local is_map
+    is_map=$(node -e "
+      const d = JSON.parse(require('fs').readFileSync('$src','utf8'));
+      console.log(!Array.isArray(d) && typeof d === 'object' ? 'yes' : 'no');
+    " 2>/dev/null)
+    if [[ "$is_map" == "yes" ]]; then
+      # Split into per-collection files
+      node -e "
+        const { writeFileSync } = require('fs');
+        const d = JSON.parse(require('fs').readFileSync('$src','utf8'));
+        let n = 0;
+        for (const [coll, rows] of Object.entries(d)) {
+          if (!Array.isArray(rows)) continue;
+          writeFileSync('$seed_dir/' + coll + '.json', JSON.stringify(rows, null, 2));
+          console.log('  wrote ' + coll + '.json (' + rows.length + ' rows)');
+          n++;
+        }
+        console.log('split ' + n + ' collections');
+      " 2>&1 | tee -a "$LOG_DIR/seed.log"
+    else
+      # Single-collection array
+      local base; base=$(basename "$src")
+      cp "$src" "$seed_dir/$base"
+      ok "Copied → $seed_dir/$base"
+    fi
+  elif [[ "$src" =~ \.csv$ ]]; then
+    local base; base=$(basename "$src" .csv)
+    # Convert CSV to JSON (minimal — header row + comma-separated values)
+    node -e "
+      const { readFileSync, writeFileSync } = require('fs');
+      const lines = readFileSync('$src','utf8').split(/\r?\n/).filter(Boolean);
+      if (lines.length < 2) { console.error('CSV too small'); process.exit(1); }
+      const headers = lines[0].split(',');
+      const rows = lines.slice(1).map(line => {
+        const vals = line.split(',');
+        const o = {};
+        headers.forEach((h, i) => { o[h.trim()] = vals[i]?.trim() ?? null; });
+        return o;
+      });
+      writeFileSync('$seed_dir/${base}.json', JSON.stringify(rows, null, 2));
+      console.log('Converted ' + rows.length + ' rows → $seed_dir/${base}.json');
+    " 2>&1 | tee -a "$LOG_DIR/seed.log"
+  else
+    err "Unsupported file type — use .json or .csv"
+  fi
+  pause
+}
+
+# ------------------------------------------------------------
+# seed : generate empty templates
+# ------------------------------------------------------------
+
+action_seed_generate_templates() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Generate empty seed templates${RESET}"
+  echo
+
+  if [[ ! -f "$GENERATED_DIR/entities.json" ]]; then
+    err "No entities.json — run menu 1 (Convert) first"
+    pause; return
+  fi
+
+  local seed_dir="$CONFIG_DIR/seeds"
+  mkdir -p "$seed_dir"
+
+  if ! confirm "Generate a template .json per entity (will NOT overwrite existing files)?"; then
+    return
+  fi
+
+  node -e "
+    const { readFileSync, writeFileSync, existsSync } = require('fs');
+    const entities = JSON.parse(readFileSync('$GENERATED_DIR/entities.json','utf8'));
+    let created = 0, skipped = 0;
+    for (const e of entities) {
+      const file = '$seed_dir/' + e.collection + '.json';
+      if (existsSync(file)) { skipped++; continue; }
+
+      // Build a sample row from field defaults
+      const sample = {};
+      for (const [k, def] of Object.entries(e.fields ?? {})) {
+        if (def.default !== undefined && typeof def.default !== 'object') sample[k] = def.default;
+        else if (def.type === 'string' && def.enum) sample[k] = def.enum[0] ?? '';
+        else if (def.type === 'string')  sample[k] = 'example';
+        else if (def.type === 'number')  sample[k] = 0;
+        else if (def.type === 'boolean') sample[k] = false;
+        else if (def.type === 'date')    sample[k] = new Date().toISOString();
+        else if (def.type === 'json')    sample[k] = {};
+        else if (def.type === 'array')   sample[k] = [];
+      }
+      writeFileSync(file, JSON.stringify([sample], null, 2));
+      created++;
+    }
+    console.log('Created ' + created + ', skipped ' + skipped + ' (already existed)');
+  " 2>&1 | tee -a "$LOG_DIR/seed.log"
+  pause
+}
+
+# ------------------------------------------------------------
+# seed : validate + apply
+# ------------------------------------------------------------
+
+action_seed_apply() {
+  local mode="$1"   # validate | apply | upsert | truncate-apply
+  header
+  local title="Validate seeds (dry-run)"
+  case "$mode" in
+    apply)          title="Apply seeds (insert)"           ;;
+    upsert)         title="Apply seeds (upsert by id)"     ;;
+    truncate-apply) title="DESTRUCTIVE: truncate + apply"  ;;
+  esac
+  echo -e "${BOLD}${MAGENTA}▶ $title${RESET}"
+  echo
+
+  load_env
+
+  if [[ ! -f "$GENERATED_DIR/entities.json" ]]; then
+    err "No entities.json — run menu 1 (Convert) first"
+    pause; return
+  fi
+
+  local seed_dir="$CONFIG_DIR/seeds"
+  local file_count
+  file_count=$(ls -1 "$seed_dir"/*.json 2>/dev/null | wc -l)
+  if [[ $file_count -eq 0 ]]; then
+    err "No seed files in $seed_dir — use menu S → 1 or 2"
+    pause; return
+  fi
+
+  if [[ "$mode" == "truncate-apply" ]]; then
+    warn "This will TRUNCATE all tables listed in seeds before inserting."
+    confirm "Really wipe the tables ?" || return
+    if ! confirm "Are you SURE ? This cannot be undone." ; then return; fi
+  fi
+
+  if [[ "$mode" != "validate" ]]; then
+    if [[ -z "${DB_DIALECT:-}" || -z "${SGBD_URI:-}" ]]; then
+      err "No DB configured (menu 2 first)"
+      pause; return
+    fi
+    # Dialect specific driver
+    ensure_pkg "@mostajs/orm" || return
+    ensure_dialect_driver "$DB_DIALECT" || warn "Driver for $DB_DIALECT may be missing"
+  fi
+
+  local orm_path
+  orm_path=$(resolve_pkg_path "@mostajs/orm" 2>/dev/null)
+  if [[ "$mode" != "validate" ]] && [[ -z "$orm_path" ]]; then
+    err "Cannot resolve @mostajs/orm — install it first"
+    pause; return
+  fi
+
+  cat > "$CONFIG_DIR/seed-runner.mjs" <<EOF
+import { readFileSync, readdirSync } from 'fs';
+import { join } from 'path';
+
+const MODE    = process.argv[2] ?? 'validate';
+const SEEDDIR = process.argv[3];
+const ENTPATH = process.argv[4];
+const DIALECT = process.env.DB_DIALECT ?? '';
+const URI     = process.env.SGBD_URI ?? '';
+
+function stripScheme(u) {
+  if (u.startsWith('sqlite://')) return u.slice(9);
+  if (u.startsWith('sqlite:'))   return u.slice(7);
+  return u;
+}
+
+const entities = JSON.parse(readFileSync(ENTPATH, 'utf8'));
+const entityByCollection = Object.fromEntries(entities.map(e => [e.collection, e]));
+const entityByName       = Object.fromEntries(entities.map(e => [e.name, e]));
+
+// ---------- Load seed files ----------
+const seeds = {};  // collection -> rows
+for (const f of readdirSync(SEEDDIR).filter(x => x.endsWith('.json'))) {
+  const coll = f.replace(/\\.json$/, '');
+  let data;
+  try {
+    data = JSON.parse(readFileSync(join(SEEDDIR, f), 'utf8'));
+  } catch (e) {
+    console.error('  \u2717 ' + f + ' : invalid JSON (' + e.message + ')');
+    continue;
+  }
+  if (!Array.isArray(data)) {
+    console.error('  \u2717 ' + f + ' : file is not an array of rows');
+    continue;
+  }
+  seeds[coll] = data;
+}
+
+// ---------- Validate ----------
+function validateRow(row, entity) {
+  const errors = [];
+  const fieldNames = new Set(Object.keys(entity.fields ?? {}));
+  const relationNames = new Set(Object.keys(entity.relations ?? {}));
+  // Required fields
+  for (const [k, def] of Object.entries(entity.fields ?? {})) {
+    if (def.required && (row[k] === undefined || row[k] === null)) {
+      errors.push('missing required field "' + k + '"');
+    }
+    // Enum
+    if (def.enum && row[k] !== undefined && !def.enum.includes(row[k])) {
+      errors.push('field "' + k + '" not in enum ' + JSON.stringify(def.enum) + ' (got: ' + JSON.stringify(row[k]) + ')');
+    }
+    // Type basic check
+    if (row[k] !== undefined && row[k] !== null) {
+      const val = row[k];
+      const t = def.type;
+      if (t === 'number'  && typeof val !== 'number') errors.push('field "' + k + '" expected number, got ' + typeof val);
+      if (t === 'boolean' && typeof val !== 'boolean') errors.push('field "' + k + '" expected boolean, got ' + typeof val);
+      if (t === 'string'  && typeof val !== 'string') errors.push('field "' + k + '" expected string, got ' + typeof val);
+      if (t === 'date'    && typeof val !== 'string' && !(val instanceof Date)) errors.push('field "' + k + '" expected date, got ' + typeof val);
+    }
+  }
+  // Unknown fields (warn-level)
+  const warnings = [];
+  for (const k of Object.keys(row)) {
+    if (!fieldNames.has(k) && !relationNames.has(k) && k !== 'id' && k !== '_id') {
+      warnings.push('unknown field "' + k + '" (not in schema)');
+    }
+  }
+  return { errors, warnings };
+}
+
+let totalRows = 0;
+let totalErrors = 0;
+let totalWarnings = 0;
+const reports = [];
+
+for (const [coll, rows] of Object.entries(seeds)) {
+  const entity = entityByCollection[coll] ?? entityByName[coll];
+  if (!entity) {
+    console.error('  \u2717 ' + coll + ' : no matching entity (collection or name)');
+    continue;
+  }
+  let collErrs = 0, collWarns = 0;
+  rows.forEach((row, i) => {
+    const { errors, warnings } = validateRow(row, entity);
+    if (errors.length) {
+      collErrs += errors.length;
+      for (const e of errors) console.error('  \u2717 ' + coll + '[' + i + '] : ' + e);
+    }
+    collWarns += warnings.length;
+    for (const w of warnings) console.warn('  \u26A0 ' + coll + '[' + i + '] : ' + w);
+  });
+  const mark = collErrs === 0 ? '\u2713' : '\u2717';
+  console.log('  ' + mark + ' ' + coll + ' : ' + rows.length + ' rows, ' + collErrs + ' errors, ' + collWarns + ' warnings');
+  reports.push({ coll, rows: rows.length, errors: collErrs, warnings: collWarns });
+  totalRows    += rows.length;
+  totalErrors  += collErrs;
+  totalWarnings += collWarns;
+}
+
+console.log();
+console.log('Validation : ' + totalRows + ' rows · ' + totalErrors + ' errors · ' + totalWarnings + ' warnings');
+
+if (MODE === 'validate') {
+  process.exit(totalErrors > 0 ? 1 : 0);
+}
+
+if (totalErrors > 0) {
+  console.error('Refusing to apply : fix validation errors first (run menu S → 3).');
+  process.exit(2);
+}
+
+// ---------- Apply ----------
+const { getDialect } = await import('$orm_path');
+const uri = DIALECT === 'sqlite' ? stripScheme(URI) : URI;
+const d = await getDialect({ dialect: DIALECT, uri, schemaStrategy: 'update' });
+await d.initSchema(entities);
+
+let inserted = 0, failed = 0;
+
+for (const [coll, rows] of Object.entries(seeds)) {
+  const entity = entityByCollection[coll] ?? entityByName[coll];
+  if (!entity) continue;
+
+  if (MODE === 'truncate-apply') {
+    try {
+      await d.deleteMany(entity, {});
+      console.log('  \u2205 truncated ' + coll);
+    } catch (e) {
+      console.error('  \u2717 truncate ' + coll + ' : ' + (e.message ?? e));
+    }
+  }
+
+  for (const row of rows) {
+    try {
+      if (MODE === 'upsert' && (row.id || row._id)) {
+        const id = row.id ?? row._id;
+        const existing = await d.findById(entity, String(id)).catch(() => null);
+        if (existing) {
+          await d.update(entity, String(id), row);
+        } else {
+          await d.create(entity, row);
+        }
+      } else {
+        await d.create(entity, row);
+      }
+      inserted++;
+    } catch (e) {
+      failed++;
+      console.error('  \u2717 ' + coll + ' : ' + (e.message ?? e));
+    }
+  }
+  console.log('  \u2713 ' + coll + ' done');
+}
+
+console.log();
+console.log('Applied : ' + inserted + ' inserted · ' + failed + ' failed');
+await d.disconnect().catch(() => {});
+process.exit(failed > 0 ? 1 : 0);
+EOF
+
+  cd "$PROJECT_ROOT" || return
+  export DB_DIALECT="${DB_DIALECT:-}"
+  export SGBD_URI="${SGBD_URI:-}"
+  node "$CONFIG_DIR/seed-runner.mjs" "$mode" "$seed_dir" "$GENERATED_DIR/entities.json" 2>&1 | tee "$LOG_DIR/seed-${mode}.log"
+  echo
+  pause
+}
+
+# ------------------------------------------------------------
+# seed : dump current DB → seed files
+# ------------------------------------------------------------
+
+action_seed_dump() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Dump current DB rows${RESET}"
+  echo
+  load_env
+  if [[ -z "${DB_DIALECT:-}" || -z "${SGBD_URI:-}" ]]; then
+    err "No DB configured (menu 2 first)"
+    pause; return
+  fi
+  if [[ ! -f "$GENERATED_DIR/entities.json" ]]; then
+    err "No entities.json — run menu 1 (Convert) first"
+    pause; return
+  fi
+  ensure_pkg "@mostajs/orm" || return
+  local orm_path
+  orm_path=$(resolve_pkg_path "@mostajs/orm") || return
+  local dump_dir="$CONFIG_DIR/seeds-dump"
+  mkdir -p "$dump_dir"
+
+  cat > "$CONFIG_DIR/seed-dump.mjs" <<EOF
+import { readFileSync, writeFileSync } from 'fs';
+import { getDialect } from '$orm_path';
+
+const entities = JSON.parse(readFileSync('$GENERATED_DIR/entities.json','utf8'));
+const DIALECT = process.env.DB_DIALECT;
+let URI = process.env.SGBD_URI;
+if (DIALECT === 'sqlite') {
+  if (URI.startsWith('sqlite://')) URI = URI.slice(9);
+  else if (URI.startsWith('sqlite:')) URI = URI.slice(7);
+}
+const d = await getDialect({ dialect: DIALECT, uri: URI });
+await d.initSchema(entities);
+
+for (const e of entities) {
+  const rows = await d.find(e, {}, { limit: 10000 });
+  writeFileSync('$dump_dir/' + e.collection + '.json', JSON.stringify(rows, null, 2));
+  console.log('  \u2713 ' + e.collection + ' : ' + rows.length + ' rows');
+}
+await d.disconnect().catch(() => {});
+EOF
+  cd "$PROJECT_ROOT"
+  DB_DIALECT="$DB_DIALECT" SGBD_URI="$SGBD_URI" node "$CONFIG_DIR/seed-dump.mjs" 2>&1 | tee "$LOG_DIR/seed-dump.log"
+  echo
+  ok "Dump written to $dump_dir"
+  pause
+}
+
+action_seed_clear() {
+  header
+  local seed_dir="$CONFIG_DIR/seeds"
+  local count; count=$(ls -1 "$seed_dir"/*.json 2>/dev/null | wc -l)
+  [[ $count -eq 0 ]] && { warn "Already empty"; pause; return; }
+  if confirm "Delete all $count seed files in $seed_dir ?"; then
+    rm -f "$seed_dir"/*.json
+    ok "Cleared"
+  fi
+  pause
+}
+
+action_seed_show() {
+  header
+  local seed_dir="$CONFIG_DIR/seeds"
+  local files=()
+  for f in "$seed_dir"/*.json; do [[ -f "$f" ]] && files+=("$f"); done
+  [[ ${#files[@]} -eq 0 ]] && { warn "No seed files"; pause; return; }
+  echo "Pick a file to display :"
+  local i=1
+  for f in "${files[@]}"; do
+    echo -e "  ${CYAN}$i${RESET}) $(basename "$f")"
+    i=$((i+1))
+  done
+  local num; num=$(ask "Number" 1)
+  local idx=$((num-1))
+  [[ $idx -ge 0 && $idx -lt ${#files[@]} ]] && ${PAGER:-less} "${files[$idx]}"
   pause
 }
 
