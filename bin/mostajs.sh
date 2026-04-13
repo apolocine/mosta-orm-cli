@@ -1508,6 +1508,7 @@ menu_seeding() {
   echo -e "  ${CYAN}7${RESET}) Dump current DB rows → .mostajs/seeds-dump/"
   echo -e "  ${CYAN}8${RESET}) Clear the seeds directory"
   echo -e "  ${CYAN}9${RESET}) Show a seed file"
+  echo -e "  ${CYAN}h${RESET}) ${BOLD}Hash plain-text passwords in seed files${RESET} (bcrypt)"
   echo
   echo -e "  ${CYAN}b${RESET}) Back"
   echo
@@ -1523,10 +1524,103 @@ menu_seeding() {
     7) action_seed_dump ;;
     8) action_seed_clear ;;
     9) action_seed_show ;;
+    h|H) action_seed_hash_passwords ;;
     b|B) return ;;
     *) warn "Unknown"; pause ;;
   esac
   menu_seeding
+}
+
+# ------------------------------------------------------------
+# seed : hash plain-text passwords
+# ------------------------------------------------------------
+
+action_seed_hash_passwords() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Hash plain-text passwords in seed files${RESET}"
+  echo
+
+  local seed_dir="$CONFIG_DIR/seeds"
+  local count
+  count=$(ls -1 "$seed_dir"/*.json 2>/dev/null | wc -l)
+  if [[ $count -eq 0 ]]; then
+    err "No seed files in $seed_dir (menu S → 1 first)"
+    pause; return
+  fi
+
+  echo "Auto-detects fields named :"
+  dim "  password, passwordHash, hashedPassword, pwd, userPassword"
+  echo
+  echo "Skips values that are already bcrypt hashes (start with \$2a\$ / \$2b\$ / \$2y\$, 60 chars)"
+  echo
+
+  local cost
+  cost=$(ask "bcrypt cost factor" "${BCRYPT_COST:-10}")
+  if ! confirm "Hash all plain passwords in $seed_dir ?"; then
+    return
+  fi
+
+  # Ensure bcryptjs is available
+  ensure_pkg "bcryptjs" || { pause; return; }
+
+  cat > "$CONFIG_DIR/seed-hash.mjs" <<EOF
+import { readdirSync, readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import bcrypt from 'bcryptjs';
+
+const SEEDDIR = '$seed_dir';
+const COST    = $cost;
+
+// Field names commonly used for passwords
+const PASSWORD_FIELDS = ['password', 'passwordHash', 'hashedPassword', 'pwd', 'userPassword'];
+
+// Test if a string is already a bcrypt hash
+const isBcrypt = v => typeof v === 'string' && /^\\\$2[ayb]\\\$\\d{1,2}\\\$/.test(v) && v.length === 60;
+
+let totalHashed = 0;
+let totalSkipped = 0;
+const summary = [];
+
+for (const f of readdirSync(SEEDDIR).filter(x => x.endsWith('.json'))) {
+  const path = join(SEEDDIR, f);
+  let data;
+  try { data = JSON.parse(readFileSync(path, 'utf8')); }
+  catch { continue; }
+
+  if (!Array.isArray(data)) continue;
+
+  let hashed = 0, skipped = 0;
+  for (const row of data) {
+    for (const field of PASSWORD_FIELDS) {
+      const val = row[field];
+      if (typeof val !== 'string' || val.length === 0) continue;
+      if (isBcrypt(val)) { skipped++; continue; }
+      row[field] = bcrypt.hashSync(val, COST);
+      hashed++;
+    }
+  }
+
+  if (hashed > 0) {
+    writeFileSync(path, JSON.stringify(data, null, 2));
+    summary.push({ file: f, hashed, skipped });
+  }
+  totalHashed  += hashed;
+  totalSkipped += skipped;
+}
+
+for (const s of summary) {
+  console.log('  \u2713 ' + s.file + ' : ' + s.hashed + ' hashed' + (s.skipped ? ' (+ ' + s.skipped + ' already hashed)' : ''));
+}
+console.log();
+console.log('Total : ' + totalHashed + ' hashed, ' + totalSkipped + ' already-hashed skipped');
+if (totalHashed === 0 && totalSkipped === 0) {
+  console.log('No password fields found.');
+}
+EOF
+  cd "$PROJECT_ROOT"
+  node "$CONFIG_DIR/seed-hash.mjs" 2>&1 | tee "$LOG_DIR/seed-hash.log"
+  echo
+  pause
 }
 
 # ------------------------------------------------------------
@@ -1750,6 +1844,9 @@ for (const f of readdirSync(SEEDDIR).filter(x => x.endsWith('.json'))) {
 }
 
 // ---------- Validate ----------
+const PASSWORD_FIELDS = ['password', 'passwordHash', 'hashedPassword', 'pwd', 'userPassword'];
+const isBcrypt = v => typeof v === 'string' && /^\\\$2[ayb]\\\$\\d{1,2}\\\$/.test(v) && v.length === 60;
+
 function validateRow(row, entity) {
   const errors = [];
   const fieldNames = new Set(Object.keys(entity.fields ?? {}));
@@ -1778,6 +1875,12 @@ function validateRow(row, entity) {
   for (const k of Object.keys(row)) {
     if (!fieldNames.has(k) && !relationNames.has(k) && k !== 'id' && k !== '_id') {
       warnings.push('unknown field "' + k + '" (not in schema)');
+    }
+  }
+  // Password fields that look like plain-text (not bcrypt)
+  for (const pf of PASSWORD_FIELDS) {
+    if (row[pf] !== undefined && row[pf] !== null && row[pf] !== '' && !isBcrypt(row[pf])) {
+      warnings.push('field "' + pf + '" does not look like a bcrypt hash — run menu S \u2192 h to hash');
     }
   }
   return { errors, warnings };
@@ -2122,6 +2225,55 @@ EOF
 
 run_subcommand() {
   case "$1" in
+    hash|h)
+      # mostajs hash <plaintext> [cost]
+      local pw="${2:-}"
+      local cost="${3:-10}"
+      [[ -z "$pw" ]] && { echo "Usage: mostajs hash <password> [cost=10]" >&2; exit 1; }
+      # Try local project, then CLI's own node_modules (bcryptjs is a dep)
+      local bcrypt_dir=""
+      if [[ -d "$PROJECT_ROOT/node_modules/bcryptjs" ]]; then
+        bcrypt_dir="$PROJECT_ROOT/node_modules/bcryptjs"
+      else
+        local cli_dir
+        cli_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        [[ -d "$cli_dir/node_modules/bcryptjs" ]] && bcrypt_dir="$cli_dir/node_modules/bcryptjs"
+      fi
+      if [[ -z "$bcrypt_dir" ]]; then
+        ensure_pkg "bcryptjs" >/dev/null 2>&1 || {
+          err "bcryptjs not available. Install it manually : npm install bcryptjs"
+          exit 1
+        }
+        bcrypt_dir="$PROJECT_ROOT/node_modules/bcryptjs"
+      fi
+      BCRYPT_PASSWORD="$pw" BCRYPT_COST="$cost" BCRYPT_DIR="$bcrypt_dir" node -e "
+        const bcrypt = require(process.env.BCRYPT_DIR);
+        const h = bcrypt.hashSync(process.env.BCRYPT_PASSWORD, parseInt(process.env.BCRYPT_COST, 10));
+        console.log(h);
+      "
+      ;;
+    verify|v)
+      # mostajs verify <plaintext> <hash>
+      local pw="${2:-}"
+      local hashval="${3:-}"
+      [[ -z "$pw" || -z "$hashval" ]] && { echo "Usage: mostajs verify <password> <hash>" >&2; exit 1; }
+      local bcrypt_dir=""
+      if [[ -d "$PROJECT_ROOT/node_modules/bcryptjs" ]]; then
+        bcrypt_dir="$PROJECT_ROOT/node_modules/bcryptjs"
+      else
+        local cli_dir
+        cli_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        [[ -d "$cli_dir/node_modules/bcryptjs" ]] && bcrypt_dir="$cli_dir/node_modules/bcryptjs"
+      fi
+      if [[ -z "$bcrypt_dir" ]]; then
+        ensure_pkg "bcryptjs" >/dev/null 2>&1 || exit 1
+        bcrypt_dir="$PROJECT_ROOT/node_modules/bcryptjs"
+      fi
+      BCRYPT_PASSWORD="$pw" BCRYPT_HASH="$hashval" BCRYPT_DIR="$bcrypt_dir" node -e "
+        const bcrypt = require(process.env.BCRYPT_DIR);
+        console.log(bcrypt.compareSync(process.env.BCRYPT_PASSWORD, process.env.BCRYPT_HASH) ? 'match' : 'no match');
+      "
+      ;;
     convert|c)
       detect_project
       [[ ${#DETECTED_TYPES[@]} -eq 0 ]] && { err "No schema found"; exit 1; }
@@ -2150,11 +2302,17 @@ run_subcommand() {
     help|-h|--help)
       cat <<EOF
 Usage :
-  $CLI_NAME                 Interactive menu
-  $CLI_NAME convert         Run conversion (auto-detect schema type)
-  $CLI_NAME detect          Print detected schemas
-  $CLI_NAME health          Run health checks
-  $CLI_NAME version         Print version
+  $CLI_NAME                         Interactive menu
+  $CLI_NAME convert                 Run conversion (auto-detect schema type)
+  $CLI_NAME detect                  Print detected schemas
+  $CLI_NAME health                  Run health checks
+  $CLI_NAME hash <password> [cost]  Hash a password with bcrypt (cost default 10)
+  $CLI_NAME verify <password> <hash> Check if a plain password matches a bcrypt hash
+  $CLI_NAME version                 Print version
+
+Examples:
+  $CLI_NAME hash 'Admin@123456'     → \$2b\$10\$N9qo8uLOickgx2ZMRZoMyeIjZA...
+  $CLI_NAME verify 'Admin@123456' '\$2b\$10\$N9qo...'
 EOF
       ;;
     *)
@@ -2175,6 +2333,8 @@ EOF
 
 # Non-interactive mode if args provided
 if [[ $# -gt 0 ]]; then
+  detect_project  # populates PKG_MANAGER, PROJECT_ROOT, etc.
+  load_env        # optional config for subcommands that need it
   run_subcommand "$@"
   exit 0
 fi
