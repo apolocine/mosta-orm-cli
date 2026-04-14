@@ -2515,14 +2515,69 @@ run_subcommand() {
       fi
 
       mkdir -p "$CONFIG_DIR"
-      if [[ ! -f "$CONFIG_DIR/config.env" ]]; then
+      # ── Database choice ──
+      # Resolution order :
+      #   1. existing .mostajs/config.env → honour it (user may have set it with `mostajs` menu 2)
+      #   2. --dialect / --uri / --strategy CLI flags → non-interactive scripting
+      #   3. $DB_DIALECT + $SGBD_URI env vars → non-interactive, no files on disk
+      #   4. interactive prompt (default)
+      if [[ -f "$CONFIG_DIR/config.env" ]]; then
+        load_env
+        info "  using existing $CONFIG_DIR/config.env  (dialect=$DB_DIALECT  uri=$SGBD_URI)"
+      else
+        local bs_dialect="" bs_uri="" bs_strategy="update"
+        for arg in "$@"; do
+          case "$arg" in
+            --dialect=*)  bs_dialect="${arg#--dialect=}" ;;
+            --uri=*)      bs_uri="${arg#--uri=}" ;;
+            --strategy=*) bs_strategy="${arg#--strategy=}" ;;
+          esac
+        done
+        # Fall back to env vars
+        [[ -z "$bs_dialect" ]] && bs_dialect="${DB_DIALECT:-}"
+        [[ -z "$bs_uri"     ]] && bs_uri="${SGBD_URI:-}"
+
+        if [[ -z "$bs_dialect" || -z "$bs_uri" ]]; then
+          echo
+          echo -e "${BOLD}▶ Database choice${RESET}    ${DIM}(run \`$CLI_NAME\` then menu 2 beforehand to skip this prompt)${RESET}"
+          echo
+          echo "  ${CYAN}1${RESET}) SQLite         ${DIM}./data.sqlite               (zero setup, recommended for trying out)${RESET}"
+          echo "  ${CYAN}2${RESET}) PostgreSQL     ${DIM}postgres://user:pass@host:5432/db${RESET}"
+          echo "  ${CYAN}3${RESET}) MongoDB        ${DIM}mongodb://user:pass@host:27017/db${RESET}"
+          echo "  ${CYAN}4${RESET}) MySQL          ${DIM}mysql://user:pass@host:3306/db${RESET}"
+          echo "  ${CYAN}5${RESET}) MariaDB        ${DIM}mariadb://user:pass@host:3306/db${RESET}"
+          echo "  ${CYAN}6${RESET}) Oracle         ${DIM}oracle://user:pass@host:1521/XE${RESET}"
+          echo "  ${CYAN}7${RESET}) SQL Server     ${DIM}mssql://user:pass@host:1433/db${RESET}"
+          echo "  ${CYAN}8${RESET}) CockroachDB    ${DIM}postgresql://user:pass@host:26257/db?sslmode=disable${RESET}"
+          echo "  ${CYAN}9${RESET}) DB2 / HANA / HSQLDB / Spanner / Sybase / other (enter manually)"
+          echo
+          local c; c=$(ask "Choice" "1")
+          case "$c" in
+            1) bs_dialect="sqlite";      bs_uri=$(ask "SQLite path" "./data.sqlite") ;;
+            2) bs_dialect="postgres";    bs_uri=$(ask "Postgres URI" "postgres://user:pass@localhost:5432/mydb") ;;
+            3) bs_dialect="mongodb";    bs_uri=$(ask "MongoDB URI"  "mongodb://localhost:27017/mydb") ;;
+            4) bs_dialect="mysql";      bs_uri=$(ask "MySQL URI"    "mysql://user:pass@localhost:3306/mydb") ;;
+            5) bs_dialect="mariadb";    bs_uri=$(ask "MariaDB URI"  "mariadb://user:pass@localhost:3306/mydb") ;;
+            6) bs_dialect="oracle";     bs_uri=$(ask "Oracle URI"   "oracle://user:pass@localhost:1521/XE") ;;
+            7) bs_dialect="mssql";      bs_uri=$(ask "SQL Server URI" "mssql://user:pass@localhost:1433/mydb") ;;
+            8) bs_dialect="cockroachdb"; bs_uri=$(ask "CockroachDB URI" "postgresql://root@localhost:26257/mydb?sslmode=disable") ;;
+            9) bs_dialect=$(ask "Dialect (db2|hana|hsqldb|spanner|sybase|other)" "")
+               bs_uri=$(ask "URI" "") ;;
+            *) err "Invalid choice"; exit 1 ;;
+          esac
+          [[ -z "$bs_dialect" || -z "$bs_uri" ]] && { err "dialect and uri are required"; exit 1; }
+
+          local chosen_strategy
+          chosen_strategy=$(ask "Schema strategy (validate|update|create|create-drop|none)" "$bs_strategy")
+          bs_strategy="$chosen_strategy"
+        fi
+
         cat > "$CONFIG_DIR/config.env" <<CFG
-DB_DIALECT=sqlite
-SGBD_URI=./data.sqlite
-DB_SCHEMA_STRATEGY=update
+DB_DIALECT=$bs_dialect
+SGBD_URI=$bs_uri
+DB_SCHEMA_STRATEGY=$bs_strategy
 CFG
-        ok "  wrote $CONFIG_DIR/config.env (defaults: sqlite ./data.sqlite)"
-        # Reload config so action_init_dialects picks up the new values
+        ok "  wrote $CONFIG_DIR/config.env (dialect=$bs_dialect)"
         load_env
       fi
 
@@ -2542,7 +2597,7 @@ CFG
 
   ✓ Bridge installed in-place.  Original files backed up as *.prisma.bak
   ✓ Schema converted :   $GENERATED_DIR/entities.json
-  ✓ DDL applied        (DB_DIALECT=\$(grep ^DB_DIALECT $CONFIG_DIR/config.env | cut -d= -f2))
+  ✓ DDL applied        (DB_DIALECT=$DB_DIALECT  SGBD_URI=$SGBD_URI)
 
   Next :
     - Add seeds to $CONFIG_DIR/seeds/*.json   (one file per entity)
@@ -2566,8 +2621,11 @@ DONE
       cat <<EOF
 Usage :
   $CLI_NAME                         Interactive menu
-  $CLI_NAME bootstrap               One-shot migration : codemod + deps + convert + DDL
-  $CLI_NAME install-bridge          Codemod only (dry-run ; add --apply to write)
+  $CLI_NAME bootstrap                 One-shot migration : codemod + deps + convert + DDL
+                                      (interactive database picker unless config exists)
+  $CLI_NAME bootstrap --dialect=postgres --uri=postgres://... --strategy=update
+                                      Non-interactive bootstrap (for CI / scripts)
+  $CLI_NAME install-bridge            Codemod only (dry-run ; add --apply to write)
   $CLI_NAME install-bridge --apply  Rewrite PrismaClient sites to use @mostajs/orm-bridge
   $CLI_NAME install-bridge --restore --apply     Undo a prior install-bridge
   $CLI_NAME convert                 Run conversion (auto-detect schema type)

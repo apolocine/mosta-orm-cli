@@ -1,6 +1,6 @@
 {
   "name": "@mostajs/orm-cli",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Universal CLI to integrate @mostajs/orm into any project — one-shot `mostajs bootstrap` migrates a Prisma project (codemod + deps + schema convert + DDL) to 13 databases with zero code change.",
   "author": "Dr Hamid MADANI <drmdh@msn.com>",
   "license": "AGPL-3.0-or-later",

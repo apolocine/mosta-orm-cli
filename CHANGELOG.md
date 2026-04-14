@@ -2,6 +2,39 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.4.3] — 2026-04-14
+
+### Added
+
+- **`bootstrap` now asks for the database.** Instead of silently writing
+  `DB_DIALECT=sqlite` / `SGBD_URI=./data.sqlite`, bootstrap now presents an
+  interactive picker covering the 13 supported dialects, with a sensible
+  example URI for each. Users who want SQLite still type Enter.
+- **Non-interactive flags** for CI / scripting :
+  ```
+  mostajs bootstrap --dialect=postgres --uri=postgres://... --strategy=update
+  ```
+  Also honours `DB_DIALECT` / `SGBD_URI` environment variables if present.
+- **Existing `.mostajs/config.env` is honoured** with no prompt — so a user
+  who runs `mostajs` menu 2 (Configure database URIs) first then runs
+  `bootstrap` flows smoothly into DDL init without being re-asked.
+
+### Fixed
+
+- **Cosmetic bug in the success banner** — the final line used an escaped
+  shell substitution (`\$(...)`) which printed literally instead of being
+  expanded. Replaced with direct `$DB_DIALECT` / `$SGBD_URI` variables.
+
+## [0.4.2] — 2026-04-14
+
+### Fixed
+
+- Codemod no longer emits `import 'server-only'` in the generated `db.ts`
+  template. The guard crashed apps that still use the Next.js `pages/`
+  directory alongside `app/` (FitZoneGym-style mixed projects). The lazy
+  dialect loading in `@mostajs/orm@1.9.3+` makes the guard redundant for
+  correctness.
+
 ## [0.4.1] — 2026-04-14
 
 ### Fixed — `mostajs bootstrap` reliability
