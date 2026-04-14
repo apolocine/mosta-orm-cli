@@ -1,137 +1,189 @@
 # @mostajs/orm-cli
 
-> **Universal interactive CLI for @mostajs/orm integration.**
-> Auto-detects Prisma / OpenAPI / JSON Schema in any project, converts to EntitySchema[], tests with humans / mobiles / AI agents, and launches everything.
+> **Automated migration from Prisma to @mostajs/orm.**
+>
+> `npx @mostajs/orm-cli bootstrap` scans your Prisma project, rewrites every `new PrismaClient(...)` site to use the @mostajs/orm-bridge (backing up the originals), installs the runtime, converts your schema, and applies DDL — in one command.
 
 [![npm version](https://img.shields.io/npm/v/@mostajs/orm-cli.svg)](https://www.npmjs.com/package/@mostajs/orm-cli)
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](LICENSE)
 
-## Install
-
-### Option 1 — npx (zero install)
+## Zero-touch migration
 
 ```bash
-cd your/project
-npx @mostajs/orm-cli
+cd my-existing-prisma-app
+npx @mostajs/orm-cli bootstrap
+npm run dev
+# db.User.findMany(...) now runs on any of 13 databases. Zero code change.
 ```
 
-### Option 2 — global
+That single command does :
+
+1. **Codemod** — scans the repo for `new PrismaClient(...)`, detects each export name (`prisma`, `db`, `client`, default), and rewrites each site to `createPrismaLikeDb()` from `@mostajs/orm-bridge`. Originals backed up as `*.prisma.bak`.
+2. **Install** — `@mostajs/orm` + `@mostajs/orm-bridge` + `@mostajs/orm-adapter` + `server-only`.
+3. **Convert** — `prisma/schema.prisma` → `.mostajs/generated/entities.json`.
+4. **DDL** — writes `.mostajs/config.env` (SQLite defaults) and creates tables.
+
+**Every step stops on error** (v0.4.1+) so you never see a lying success banner.
+
+To undo :
+
+```bash
+npx @mostajs/orm-cli install-bridge --restore --apply
+```
+
+## Install
+
+### Zero-install (recommended)
+
+```bash
+npx @mostajs/orm-cli bootstrap
+```
+
+### Global
 
 ```bash
 npm install -g @mostajs/orm-cli
 cd your/project
-mostajs
+mostajs bootstrap
 ```
 
-### Option 3 — curl one-liner (Unix)
+## Subcommands
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/apolocine/mosta-orm-cli/main/install.sh | bash
-```
+| Command | What it does |
+|---|---|
+| `mostajs bootstrap` | Full migration : codemod + install + convert + DDL |
+| `mostajs install-bridge` | Run the codemod (dry-run by default) |
+| `mostajs install-bridge --apply` | Write the codemod changes |
+| `mostajs install-bridge --file <path>` | Restrict to one file |
+| `mostajs install-bridge --restore --apply` | Revert `.prisma.bak` backups |
+| `mostajs convert` | Auto-detect schema (Prisma / OpenAPI / JSONSchema) and convert |
+| `mostajs detect` | Print what's detected in the project |
+| `mostajs health` | Verify Node / pnpm / schemas / entities.json state |
+| `mostajs hash <password> [cost]` | Bcrypt a password (for seed data) |
+| `mostajs verify <password> <hash>` | Check a password/hash pair |
+| `mostajs diagnose [email] [password]` | Walk through login diagnostics |
+| `mostajs help` | Usage |
+| `mostajs version` | Print version |
 
-## Usage
-
-### Interactive menu (recommended)
+## Interactive menu
 
 ```bash
 cd your/project
 mostajs
 ```
 
-The CLI auto-detects :
-- **Prisma** : `prisma/schema.prisma`
-- **OpenAPI** : `openapi.yaml`, `openapi.json`, `api.yaml`, `spec/openapi.yaml`, etc.
-- **JSON Schema** : `schemas/*.json`
-
-Menu :
+Detected schemas are listed. Pick :
 
 ```
 1) Convert schema → EntitySchema[]
-2) Configure database URIs     (13 databases)
-3) Initialize dialects         (connect + create tables)
-4) Tests menu                  (human / mobile / AI / curl / playwright)
-5) Start services              (Next.js + mosta-net)
+2) Configure database URIs
+3) Initialize dialects (connect + create tables)
+4) Tests menu (human / mobile / AI agent / curl / playwright)
+5) Start services
 6) Metrics & status
 7) View logs
 8) Health checks
-9) Generate boilerplate        (src/db.ts / .env.example)
+9) Generate boilerplate (src/db.ts / .env.example)
+s) Seeding (upload / validate / hash / apply)
+b) Bootstrap — one-shot Prisma migration
+i) Install bridge (codemod)
 0) About / Help
+q) Quit
 ```
 
-### Non-interactive subcommands
+## The codemod, in detail
+
+`mostajs install-bridge` is safe by default — **dry-run** reports what it would change, without touching files :
+
+```
+$ mostajs install-bridge
+▶ mostajs install-bridge — scanning /home/me/my-app
+
+Found 3 PrismaClient instantiation site(s):
+  → src/lib/db.ts         (const db)
+  → src/server/prisma.ts  (const prisma)
+  → scripts/seed.ts       (const prisma)
+
+Dry-run — no files written. Re-run with --apply to execute.
+```
+
+Detection rules :
+- Must contain `import ... from '@prisma/client'` AND `new PrismaClient(`
+- Files that already use `@mostajs/orm-bridge/prisma-client` are skipped (idempotent re-runs)
+- Export shape is preserved : `const db`, `const prisma`, `let client`, `export default`, and `const x = ...; export { x }`
+
+Replacement format :
+
+```ts
+// Auto-generated by `mostajs install-bridge` on 2026-04-14T02:03:38Z
+// Original file backed up as <this-file>.prisma.bak
+// Every db/prisma/client call is now routed to @mostajs/orm (13 dialects).
+import { createPrismaLikeDb } from '@mostajs/orm-bridge/prisma-client'
+
+export const db = createPrismaLikeDb()
+```
+
+## Supported schemas at input
+
+The CLI auto-detects :
+- **Prisma** — `prisma/schema.prisma`
+- **OpenAPI** — `openapi.yaml`, `openapi.json`, `api.yaml`, `spec/openapi.yaml`, …
+- **JSON Schema** — `schemas/*.json`
+
+Conversion goes through `@mostajs/orm-adapter` (4 adapters).
+
+## Supported databases (13)
+
+SQLite · PostgreSQL · MySQL · MariaDB · MongoDB · Oracle · SQL Server · CockroachDB · DB2 · SAP HANA · HSQLDB · Spanner · Sybase
+
+Switch database by editing `.mostajs/config.env` (or `.env`) :
 
 ```bash
-mostajs convert    # auto-detect + convert
-mostajs detect     # print detected schemas
-mostajs health     # check tools + project state
-mostajs version
-mostajs help
+DB_DIALECT=postgres
+SGBD_URI=postgres://user:pass@host:5432/mydb
 ```
 
-## What it does
+Then re-run `mostajs` → menu 3 (init DDL) → menu S → 4 (apply seeds). Same code.
 
-### Tests menu — everything you need to verify
-
-- **Human** : opens browser on `http://localhost:3000`
-- **Mobile** : generates QR code for LAN URL (needs `qrencode`)
-- **AI** : displays ready-to-paste Claude Desktop MCP config
-- **curl** : smoke-tests all endpoints with status codes + times
-- **Playwright** : runs existing test suite
-
-### Config stored per-project
+## Project layout
 
 ```
-your-project/.mostajs/
-├── config.env              # URIs + ports
-├── generated/entities.ts   # EntitySchema[] (auto-generated)
-└── logs/                   # dev / convert / init logs
+your-project/
+├── prisma/schema.prisma            # unchanged
+├── src/lib/db.ts                   # 3 lines now (createPrismaLikeDb)
+├── src/lib/db.ts.prisma.bak        # original, in case you want to revert
+└── .mostajs/
+    ├── config.env                  # DB_DIALECT, SGBD_URI, DB_SCHEMA_STRATEGY
+    ├── generated/entities.json     # converted schema (13-DB-ready)
+    ├── seeds/*.json                # one per entity, hashed by menu S → h
+    └── logs/                       # convert / init / seed / dev
 ```
 
-### Supported databases (13)
+## Example — FitZoneGym
 
-PostgreSQL · MySQL · MariaDB · SQLite · MS SQL Server · Oracle · DB2 · HANA · HSQLDB · Spanner · Sybase · CockroachDB · MongoDB
-
-## Example workflow (any Prisma app)
+FitZoneGym (production-grade Next.js 15 + Prisma, 40 models, 67 files importing Prisma) was migrated end-to-end with :
 
 ```bash
-$ cd my-nextjs-app
-$ mostajs
-
-  Project : /path/to/my-nextjs-app
-  Manager : pnpm
-  Detected:
-    ✓ Prisma schema (40 models)
-    ⚠ entities.ts not generated
-
-  Choice [1]: 1                     # Convert
-  entities : 40
-  warnings : 0
-  ✓ Saved : .mostajs/generated/entities.ts
-
-  Choice [1]: 9                     # Generate boilerplate
-  ✓ Written : src/db.ts (Prisma bridge)
-
-  # now replace `new PrismaClient()` with `import { prisma } from './db.js'`
-  # ... your existing Prisma code runs on 13 databases
+cd FitZoneGym
+npx @mostajs/orm-cli bootstrap        # 15 PrismaClient sites rewritten, schema converted, DDL applied
+# manually : add seeds to .mostajs/seeds/User.json
+# manually : mostajs — menu S → h → 4
+npm run dev                           # login alice@example.com / alice123  → 302 + session
 ```
 
-## Strategy
-
-- **Schema conversion** : via [@mostajs/orm-adapter](https://www.npmjs.com/package/@mostajs/orm-adapter) — 4 adapters (Prisma, JSON Schema, OpenAPI, Native)
-- **Runtime interception** : via [@mostajs/orm-bridge](https://www.npmjs.com/package/@mostajs/orm-bridge) — route Prisma calls to any of the 13 databases
-- **Zero rewrite** : your existing `prisma.user.findMany()` stays unchanged
-
-## Links
-
-- npm : https://www.npmjs.com/package/@mostajs/orm-cli
-- GitHub : https://github.com/apolocine/mosta-orm-cli
-- Ecosystem : [@mostajs/orm](https://www.npmjs.com/package/@mostajs/orm), [@mostajs/orm-adapter](https://www.npmjs.com/package/@mostajs/orm-adapter), [@mostajs/orm-bridge](https://www.npmjs.com/package/@mostajs/orm-bridge)
+Files modified by the user : **0** (codemod owned them all). Login, dashboard, API routes all work on SQLite instead of MongoDB.
 
 ## License
 
 **AGPL-3.0-or-later** + commercial license available.
 
-For commercial use in closed-source projects : drmdh@msn.com
+For closed-source commercial use : drmdh@msn.com
+
+## Ecosystem
+
+- [@mostajs/orm](https://www.npmjs.com/package/@mostajs/orm) — the ORM (13 databases)
+- [@mostajs/orm-bridge](https://www.npmjs.com/package/@mostajs/orm-bridge) — runtime drop-in for PrismaClient
+- [@mostajs/orm-adapter](https://www.npmjs.com/package/@mostajs/orm-adapter) — schema format converters
 
 ## Author
 

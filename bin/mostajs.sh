@@ -438,6 +438,8 @@ menu_main() {
   echo -e "  ${CYAN}8${RESET}) Health checks"
   echo -e "  ${CYAN}9${RESET}) Generate boilerplate (src/db.ts with bridge)"
   echo -e "  ${CYAN}s${RESET}) ${BOLD}Seeding${RESET} (upload / validate / apply seed data)"
+  echo -e "  ${GREEN}b${RESET}) ${BOLD}Bootstrap${RESET} — one-shot migration of a Prisma project"
+  echo -e "  ${GREEN}i${RESET}) ${BOLD}Install bridge${RESET} — codemod PrismaClient → bridge (dry-run / apply / restore)"
   echo -e "  ${CYAN}0${RESET}) About / Help"
   echo
   echo -e "  ${RED}q${RESET}) Quit"
@@ -455,10 +457,61 @@ menu_main() {
     8) action_healthcheck ;;
     9) action_generate_boilerplate ;;
     s|S) menu_seeding ;;
+    b|B) menu_bootstrap ;;
+    i|I) menu_install_bridge ;;
     0) action_about ;;
     q|Q) exit 0 ;;
     *) warn "Unknown choice"; pause ;;
   esac
+}
+
+# ------------------------------------------------------------
+# Interactive wrapper for `install-bridge` codemod
+# ------------------------------------------------------------
+menu_install_bridge() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Install bridge — PrismaClient codemod${RESET}"
+  echo
+  echo "  ${CYAN}1${RESET}) Dry-run : list files that would be rewritten (default)"
+  echo "  ${CYAN}2${RESET}) Apply   : rewrite PrismaClient sites to createPrismaLikeDb()"
+  echo "  ${CYAN}3${RESET}) Restore : revert .prisma.bak files (dry-run)"
+  echo "  ${CYAN}4${RESET}) Restore : revert .prisma.bak files (apply)"
+  echo "  ${RED}0${RESET}) Back"
+  echo
+  local cli_dir
+  cli_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  local choice; choice=$(ask "Choice" "1")
+  case "$choice" in
+    1) node "$cli_dir/bin/install-bridge.mjs" ;;
+    2) node "$cli_dir/bin/install-bridge.mjs" --apply ;;
+    3) node "$cli_dir/bin/install-bridge.mjs" --restore ;;
+    4) node "$cli_dir/bin/install-bridge.mjs" --restore --apply ;;
+    0) return ;;
+    *) warn "Unknown" ;;
+  esac
+  pause
+}
+
+# ------------------------------------------------------------
+# Interactive wrapper for `bootstrap` — one-shot full migration
+# ------------------------------------------------------------
+menu_bootstrap() {
+  header
+  echo -e "${BOLD}${GREEN}▶ Bootstrap — full Prisma → @mostajs/orm migration${RESET}"
+  echo
+  echo "This will, in ${BOLD}this project${RESET} :"
+  echo "  1. Rewrite every ${CYAN}new PrismaClient()${RESET} site to use ${CYAN}createPrismaLikeDb()${RESET}"
+  echo "     (originals backed up as ${DIM}*.prisma.bak${RESET})"
+  echo "  2. Install ${CYAN}@mostajs/orm${RESET} + ${CYAN}@mostajs/orm-bridge${RESET} + ${CYAN}server-only${RESET}"
+  echo "  3. Convert ${CYAN}prisma/schema.prisma${RESET} → ${DIM}.mostajs/generated/entities.json${RESET}"
+  echo "  4. Write ${DIM}.mostajs/config.env${RESET} (default : sqlite ./data.sqlite) and init DDL"
+  echo
+  warn "Existing code changes will be backed up but NOT committed — review the diff before pushing."
+  echo
+  local go; go=$(ask "Proceed? (y/N)" "N")
+  [[ "$go" =~ ^[yY]$ ]] || { info "Cancelled"; return; }
+  run_subcommand bootstrap
+  pause
 }
 
 # ============================================================
@@ -2316,6 +2369,14 @@ EOF
 
 run_subcommand() {
   case "$1" in
+    diagnose|diag|d)
+      # mostajs diagnose [email] [password]
+      # Walks through: config vs project datasource mismatch, DB connection,
+      # user lookup, isActive check, bcrypt verification.
+      local email="${2:-}"
+      local password="${3:-}"
+      action_diagnose_login "$email" "$password"
+      ;;
     hash|h)
       # mostajs hash <plaintext> [cost]
       local pw="${2:-}"
@@ -2387,6 +2448,117 @@ run_subcommand() {
     health|h)
       action_healthcheck
       ;;
+    install-bridge|ib)
+      # mostajs install-bridge [--apply] [--file X] [--project P] [--restore]
+      # Codemod : scans the project for `new PrismaClient(...)` sites and rewrites
+      # them in place to use createPrismaLikeDb() from @mostajs/orm-bridge.
+      # Dry-run by default ; pass --apply to write the changes.
+      local cli_dir
+      cli_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+      shift
+      node "$cli_dir/bin/install-bridge.mjs" "$@"
+      ;;
+    bootstrap|b)
+      # mostajs bootstrap : the full zero-touch migration for a Prisma project.
+      #   1. Rewrite every `new PrismaClient(...)` site (install-bridge --apply)
+      #   2. npm install @mostajs/orm @mostajs/orm-bridge @mostajs/orm-adapter server-only
+      #   3. Convert prisma/schema.prisma → entities.json
+      #   4. Write .mostajs/config.env + init SQLite DDL
+      #
+      # Hard stop-on-error : no step proceeds if the previous one failed.
+      local cli_dir
+      cli_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+      detect_project
+      [[ ${#DETECTED_TYPES[@]} -eq 0 ]] && { err "No schema found. Bootstrap needs a prisma/schema.prisma (or OpenAPI/JSONSchema)."; exit 1; }
+
+      local BS_OK_CODEMOD=0 BS_OK_DEPS=0 BS_OK_CONVERT=0 BS_OK_DDL=0
+
+      # ─── Step 1 ───
+      echo -e "\n\e[1m▶ Step 1/4 : rewrite PrismaClient sites\e[0m"
+      if node "$cli_dir/bin/install-bridge.mjs" --apply; then
+        BS_OK_CODEMOD=1
+      else
+        err "Step 1 failed — codemod returned non-zero. Aborting."; exit 1
+      fi
+
+      # ─── Step 2 ───
+      echo -e "\n\e[1m▶ Step 2/4 : install runtime deps (this can take 1-2 min)\e[0m"
+      info "  installing : @mostajs/orm @mostajs/orm-bridge @mostajs/orm-adapter server-only"
+      if ( cd "$PROJECT_ROOT" && $PKG_MANAGER install \
+             @mostajs/orm @mostajs/orm-bridge @mostajs/orm-adapter server-only \
+             --legacy-peer-deps ); then
+        BS_OK_DEPS=1
+        ok "  deps installed"
+      else
+        err "Step 2 failed — \`$PKG_MANAGER install\` returned non-zero."
+        err "Fix your package manager / registry access and re-run \`mostajs bootstrap\`."
+        exit 1
+      fi
+
+      # ─── Step 3 ───
+      echo -e "\n\e[1m▶ Step 3/4 : convert schema + init DDL\e[0m"
+      local type="${DETECTED_TYPES[0]}" input
+      case "$type" in
+        prisma)     input="$PRISMA_SCHEMA" ;;
+        openapi)    input="$OPENAPI_FILE" ;;
+        jsonschema) input="${JSON_SCHEMAS[0]}" ;;
+      esac
+
+      if run_adapter_convert "$type" "$input" "$GENERATED_DIR/entities.ts" && \
+         [[ -s "$GENERATED_DIR/entities.json" || -s "$GENERATED_DIR/entities.ts" ]]; then
+        BS_OK_CONVERT=1
+        ok "  schema converted → $GENERATED_DIR/entities.json"
+      else
+        err "Step 3.1 failed — schema conversion did not produce entities.json."
+        err "Re-run manually : $CLI_NAME convert   (or menu 1)"
+        exit 1
+      fi
+
+      mkdir -p "$CONFIG_DIR"
+      if [[ ! -f "$CONFIG_DIR/config.env" ]]; then
+        cat > "$CONFIG_DIR/config.env" <<CFG
+DB_DIALECT=sqlite
+SGBD_URI=./data.sqlite
+DB_SCHEMA_STRATEGY=update
+CFG
+        ok "  wrote $CONFIG_DIR/config.env (defaults: sqlite ./data.sqlite)"
+        # Reload config so action_init_dialects picks up the new values
+        load_env
+      fi
+
+      if action_init_dialects; then
+        BS_OK_DDL=1
+        ok "  DDL applied"
+      else
+        err "Step 3.2 failed — DDL init returned non-zero."
+        err "Re-run manually : $CLI_NAME   (menu 3)"
+        exit 1
+      fi
+
+      # ─── Step 4 ───
+      echo -e "\n\e[1m▶ Step 4/4 : done\e[0m"
+      if (( BS_OK_CODEMOD && BS_OK_DEPS && BS_OK_CONVERT && BS_OK_DDL )); then
+        cat <<DONE
+
+  ✓ Bridge installed in-place.  Original files backed up as *.prisma.bak
+  ✓ Schema converted :   $GENERATED_DIR/entities.json
+  ✓ DDL applied        (DB_DIALECT=\$(grep ^DB_DIALECT $CONFIG_DIR/config.env | cut -d= -f2))
+
+  Next :
+    - Add seeds to $CONFIG_DIR/seeds/*.json   (one file per entity)
+    - $CLI_NAME             # menu S → h (hash) → 4 (apply)
+    - npm run dev
+    - Open http://localhost:3000/login
+
+  To undo the codemod :
+    $CLI_NAME install-bridge --restore --apply
+
+DONE
+      else
+        err "Bootstrap finished with partial success — see messages above."
+        exit 1
+      fi
+      ;;
     version|-v|--version)
       echo "$CLI_NAME $VERSION"
       ;;
@@ -2394,14 +2566,21 @@ run_subcommand() {
       cat <<EOF
 Usage :
   $CLI_NAME                         Interactive menu
+  $CLI_NAME bootstrap               One-shot migration : codemod + deps + convert + DDL
+  $CLI_NAME install-bridge          Codemod only (dry-run ; add --apply to write)
+  $CLI_NAME install-bridge --apply  Rewrite PrismaClient sites to use @mostajs/orm-bridge
+  $CLI_NAME install-bridge --restore --apply     Undo a prior install-bridge
   $CLI_NAME convert                 Run conversion (auto-detect schema type)
   $CLI_NAME detect                  Print detected schemas
   $CLI_NAME health                  Run health checks
   $CLI_NAME hash <password> [cost]  Hash a password with bcrypt (cost default 10)
   $CLI_NAME verify <password> <hash> Check if a plain password matches a bcrypt hash
+  $CLI_NAME diagnose [email] [pw]   Walk through login diagnostics
   $CLI_NAME version                 Print version
 
 Examples:
+  $CLI_NAME bootstrap               → zero-touch migrate a Prisma project to @mostajs/orm
+  $CLI_NAME install-bridge          → preview rewrites without touching files
   $CLI_NAME hash 'Admin@123456'     → \$2b\$10\$N9qo8uLOickgx2ZMRZoMyeIjZA...
   $CLI_NAME verify 'Admin@123456' '\$2b\$10\$N9qo...'
 EOF

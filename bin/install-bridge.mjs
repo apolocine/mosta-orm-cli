@@ -1,0 +1,204 @@
+#!/usr/bin/env node
+// install-bridge.mjs — one-shot codemod : scan a Prisma project, find every
+// file that instantiates PrismaClient, and rewrite it to use
+// createPrismaLikeDb() from @mostajs/orm-bridge.
+//
+// Author: Dr Hamid MADANI drmdh@msn.com
+// License: AGPL-3.0-or-later
+//
+// Usage (invoked by bin/mostajs.sh  as `mostajs install-bridge`) :
+//
+//   node install-bridge.mjs              # dry-run (default, safe)
+//   node install-bridge.mjs --apply      # actually write files
+//   node install-bridge.mjs --file X     # restrict to a single file
+//   node install-bridge.mjs --project P  # root to scan (default: cwd)
+//   node install-bridge.mjs --restore    # restore from .prisma.bak backups
+//
+// The rewriter is deliberately conservative :
+//   - It only touches files that CREATE a PrismaClient (`new PrismaClient(...)`).
+//   - It preserves the original export name (`prisma`, `db`, `client`, `default`)
+//     so none of the 10 to 10000 call-sites elsewhere in the codebase need to change.
+//   - Original file is saved as <path>.prisma.bak (never overwritten).
+//   - Re-runs are idempotent : if the file already uses createPrismaLikeDb,
+//     the codemod skips it.
+
+import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, renameSync, copyFileSync } from 'node:fs';
+import { join, resolve, relative, extname } from 'node:path';
+
+// ---------- CLI ----------
+const argv = process.argv.slice(2);
+const flag = (name) => argv.includes(`--${name}`);
+const val  = (name) => { const i = argv.indexOf(`--${name}`); return i >= 0 ? argv[i + 1] : null; };
+
+const APPLY    = flag('apply');
+const RESTORE  = flag('restore');
+const ONE_FILE = val('file');
+const ROOT     = resolve(val('project') ?? process.cwd());
+const QUIET    = flag('quiet');
+
+const log = (...a) => { if (!QUIET) console.log(...a); };
+const c   = { cyan: s => `\x1b[36m${s}\x1b[0m`, yellow: s => `\x1b[33m${s}\x1b[0m`, green: s => `\x1b[32m${s}\x1b[0m`, red: s => `\x1b[31m${s}\x1b[0m`, bold: s => `\x1b[1m${s}\x1b[0m`, dim: s => `\x1b[2m${s}\x1b[0m` };
+
+// ---------- Walk ----------
+const SKIP_DIRS = new Set(['node_modules', '.next', '.svelte-kit', 'dist', 'build', '.turbo', '.vercel', '.cache', 'coverage', '.git', '.vscode', '.idea']);
+const EXTENSIONS = new Set(['.ts', '.tsx', '.mts', '.js', '.jsx', '.mjs']);
+
+function* walk(dir) {
+  let entries;
+  try { entries = readdirSync(dir); } catch { return; }
+  for (const name of entries) {
+    if (SKIP_DIRS.has(name)) continue;
+    const p = join(dir, name);
+    let st;
+    try { st = statSync(p); } catch { continue; }
+    if (st.isDirectory()) yield* walk(p);
+    else if (EXTENSIONS.has(extname(name))) yield p;
+  }
+}
+
+// ---------- Detection ----------
+// Patterns we consider "PrismaClient instantiation sites"
+const RX_IMPORT = /import\s*(?:\{[^}]*PrismaClient[^}]*\}|[^;]*?)\s*from\s*['"]@prisma\/client['"]/;
+const RX_NEW    = /new\s+PrismaClient\s*\(/;
+const RX_ALREADY = /@mostajs\/orm-bridge\/prisma-client/;
+
+// Detect the export shape to preserve the name the codebase depends on.
+//   export const db = new PrismaClient(...)       → named, "db"
+//   export const prisma = new PrismaClient(...)   → named, "prisma"
+//   export default new PrismaClient(...)          → default
+//   const prisma = ...; export { prisma }         → named, "prisma"
+function detectExportShape(source) {
+  // Singleton pattern commonly used in Next.js :
+  //   const g = globalThis as ... { prisma: ... }
+  //   export const db = g.prisma ?? new PrismaClient()
+  const mNamed = source.match(/export\s+const\s+(\w+)\s*=\s*(?:[^;]*?)\bnew\s+PrismaClient/);
+  if (mNamed) return { kind: 'const', name: mNamed[1] };
+
+  const mLet = source.match(/export\s+let\s+(\w+)\s*=\s*(?:[^;]*?)\bnew\s+PrismaClient/);
+  if (mLet) return { kind: 'let', name: mLet[1] };
+
+  const mDefault = source.match(/export\s+default\s+(?:[^;]*?)\bnew\s+PrismaClient/);
+  if (mDefault) return { kind: 'default', name: null };
+
+  // Bare global : const prisma = new PrismaClient(); followed somewhere by `export { prisma }` or not
+  const mBare = source.match(/(?:^|\n)\s*(?:const|let)\s+(\w+)\s*=\s*(?:[^;]*?)\bnew\s+PrismaClient/);
+  if (mBare) {
+    const name = mBare[1];
+    if (new RegExp(`export\\s*\\{[^}]*\\b${name}\\b[^}]*\\}`).test(source)) {
+      return { kind: 'export-block', name };
+    }
+    return { kind: 'const', name };  // assume user wants to export it ; safer default
+  }
+
+  return null;
+}
+
+// ---------- Rewrite ----------
+function buildReplacement(shape) {
+  // Note : we do NOT emit `import 'server-only'` because FitZoneGym-class
+  // codebases often mix pages/ and app/ directories. `server-only` crashes
+  // the pages/ build even though the actual bundle never evaluates the
+  // forbidden import chain (lazy dialect loading in @mostajs/orm@1.9.3+).
+  // Projects that want the extra guarantee can add `import 'server-only'`
+  // manually — but it's not necessary for correctness.
+  const header = `// Auto-generated by \`mostajs install-bridge\` on ${new Date().toISOString()}\n// Original file backed up as <this-file>.prisma.bak\n// Every db/prisma/client call is now routed to @mostajs/orm (13 dialects).\nimport { createPrismaLikeDb } from '@mostajs/orm-bridge/prisma-client'\n`;
+  if (shape.kind === 'default') {
+    return `${header}\nexport default createPrismaLikeDb()\n`;
+  }
+  const kw = shape.kind === 'let' ? 'let' : 'const';
+  if (shape.kind === 'export-block') {
+    return `${header}\n${kw} ${shape.name} = createPrismaLikeDb()\nexport { ${shape.name} }\n`;
+  }
+  return `${header}\nexport ${kw} ${shape.name} = createPrismaLikeDb()\n`;
+}
+
+// ---------- Restore ----------
+function restoreBackups() {
+  const restored = [];
+  for (const p of walk(ROOT)) {
+    if (!p.endsWith('.prisma.bak')) continue;
+    const original = p.slice(0, -'.prisma.bak'.length);
+    if (APPLY) {
+      renameSync(p, original);
+      log(`  ${c.green('✓')} restored ${c.dim(relative(ROOT, original))}`);
+    } else {
+      log(`  ${c.yellow('•')} would restore ${c.dim(relative(ROOT, original))}`);
+    }
+    restored.push(original);
+  }
+  return restored;
+}
+
+// ---------- Main ----------
+if (RESTORE) {
+  log(c.bold('▶ Restoring .prisma.bak files' + (APPLY ? '' : c.yellow(' (dry-run, use --apply)'))));
+  const r = restoreBackups();
+  log(`\n${r.length} file(s) ${APPLY ? 'restored' : 'would be restored'}`);
+  process.exit(0);
+}
+
+log(c.bold(`▶ mostajs install-bridge — scanning ${c.cyan(ROOT)}`));
+log('');
+
+const candidates = [];
+const iter = ONE_FILE ? [resolve(ROOT, ONE_FILE)] : walk(ROOT);
+for (const p of iter) {
+  let src;
+  try { src = readFileSync(p, 'utf8'); } catch { continue; }
+  if (!RX_IMPORT.test(src) && !RX_NEW.test(src)) continue;
+  if (RX_ALREADY.test(src)) {
+    log(`  ${c.dim('— skip (already bridged) ' + relative(ROOT, p))}`);
+    continue;
+  }
+  if (!RX_NEW.test(src)) continue;  // imports only = not an instantiation site
+  const shape = detectExportShape(src);
+  if (!shape) {
+    log(`  ${c.yellow('?')} ${relative(ROOT, p)} — PrismaClient detected but export shape unknown, skipping`);
+    continue;
+  }
+  candidates.push({ path: p, rel: relative(ROOT, p), shape, src });
+}
+
+if (candidates.length === 0) {
+  log(c.yellow('  No instantiation sites found.'));
+  log('');
+  log(`  Did you remove \`new PrismaClient()\` already ? The bridge may already be in place.`);
+  log(`  Re-scan with: ${c.cyan('mostajs install-bridge --restore --apply')} to undo a prior run.`);
+  process.exit(0);
+}
+
+log(c.bold(`Found ${candidates.length} PrismaClient instantiation site(s):`));
+for (const ca of candidates) {
+  log(`  ${c.green('→')} ${ca.rel}  ${c.dim(`(${ca.shape.kind}${ca.shape.name ? ' ' + ca.shape.name : ''})`)}`);
+}
+log('');
+
+if (!APPLY) {
+  log(c.yellow('Dry-run — no files written. Re-run with --apply to execute.'));
+  log('');
+  log(c.bold('Preview of rewrite for the first file :'));
+  log(c.dim('─────────────────────────────────────────'));
+  log(buildReplacement(candidates[0].shape));
+  log(c.dim('─────────────────────────────────────────'));
+  process.exit(0);
+}
+
+// ---------- Apply ----------
+log(c.bold('Applying rewrites :'));
+for (const ca of candidates) {
+  const bak = ca.path + '.prisma.bak';
+  if (!existsSync(bak)) copyFileSync(ca.path, bak);
+  writeFileSync(ca.path, buildReplacement(ca.shape));
+  log(`  ${c.green('✓')} rewrote ${ca.rel}  ${c.dim(`(backup: ${relative(ROOT, bak)})`)}`);
+}
+
+log('');
+log(c.bold(c.green(`✓ Bridge installed in ${candidates.length} file(s).`)));
+log('');
+log('Next steps :');
+log(`  1. ${c.cyan('npm i @mostajs/orm @mostajs/orm-bridge server-only --legacy-peer-deps')}`);
+log(`  2. ${c.cyan('npx @mostajs/orm-cli')}  →  menu 1 (Convert Prisma → entities.json)  →  menu 3 (init DDL)`);
+log(`  3. Set ${c.cyan('DB_DIALECT')} + ${c.cyan('SGBD_URI')} in .env (or: menu 2 → i to import)`);
+log(`  4. ${c.cyan('npm run dev')}  and test.`);
+log('');
+log(`To undo : ${c.cyan('mostajs install-bridge --restore --apply')}`);
