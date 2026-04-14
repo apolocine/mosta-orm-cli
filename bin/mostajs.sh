@@ -1653,6 +1653,8 @@ menu_seeding() {
   echo -e "  ${CYAN}8${RESET}) Clear the seeds directory"
   echo -e "  ${CYAN}9${RESET}) Show a seed file"
   echo -e "  ${CYAN}h${RESET}) ${BOLD}Hash plain-text passwords in seed files${RESET} (bcrypt)"
+  echo -e "  ${CYAN}r${RESET}) ${BOLD}Restore seed scripts${RESET} from ${DIM}*.prisma.bak${RESET} (undo install-bridge on seeds)"
+  echo -e "  ${CYAN}s${RESET}) ${BOLD}Run seed scripts${RESET} (${DIM}scripts/seed-*.ts | prisma/seed.ts${RESET}) via tsx"
   echo
   echo -e "  ${CYAN}b${RESET}) Back"
   echo
@@ -1669,10 +1671,85 @@ menu_seeding() {
     8) action_seed_clear ;;
     9) action_seed_show ;;
     h|H) action_seed_hash_passwords ;;
+    r|R) action_seed_restore_scripts ;;
+    s|S) action_seed_run_scripts ;;
     b|B) return ;;
     *) warn "Unknown"; pause ;;
   esac
   menu_seeding
+}
+
+# ------------------------------------------------------------
+# seed : restore TS seed scripts from .prisma.bak (undo install-bridge)
+# ------------------------------------------------------------
+action_seed_restore_scripts() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Restore seed scripts from *.prisma.bak${RESET}"
+  echo
+  echo -e "  ${DIM}Scans for seed-like .prisma.bak files that were rewritten by install-bridge${RESET}"
+  echo -e "  ${DIM}and moves each backup back to its original filename.${RESET}"
+  echo
+  local cli_dir
+  cli_dir="$(cd "$(dirname "$0")/.." && pwd)"
+  echo -e "${DIM}\$ node install-bridge.mjs --restore-seeds --project \"$PROJECT_ROOT\"${RESET}"
+  node "$cli_dir/bin/install-bridge.mjs" --restore-seeds --project "$PROJECT_ROOT"
+  echo
+  if confirm "Apply the restoration above?"; then
+    node "$cli_dir/bin/install-bridge.mjs" --restore-seeds --apply --project "$PROJECT_ROOT"
+  else
+    dim "  Skipped."
+  fi
+  pause
+}
+
+# ------------------------------------------------------------
+# seed : run TS seed scripts via tsx (or node --loader ts-node)
+# ------------------------------------------------------------
+action_seed_run_scripts() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Run seed scripts${RESET}"
+  echo
+  # Candidate scripts : prisma/seed.ts, scripts/seed*.{ts,js}, scripts/seed.ts
+  local -a candidates=()
+  [[ -f "$PROJECT_ROOT/prisma/seed.ts" ]] && candidates+=("$PROJECT_ROOT/prisma/seed.ts")
+  [[ -f "$PROJECT_ROOT/prisma/seed.js" ]] && candidates+=("$PROJECT_ROOT/prisma/seed.js")
+  if [[ -d "$PROJECT_ROOT/scripts" ]]; then
+    while IFS= read -r f; do candidates+=("$f"); done < <(
+      find "$PROJECT_ROOT/scripts" -maxdepth 2 \( -name 'seed-*.ts' -o -name 'seed-*.js' -o -name 'seed.ts' -o -name 'seed.js' \) 2>/dev/null | sort
+    )
+  fi
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    warn "No seed scripts found under prisma/ or scripts/."
+    dim "  Expected : prisma/seed.ts | scripts/seed.ts | scripts/seed-*.ts (or .js)"
+    pause
+    return
+  fi
+  echo -e "  Found ${CYAN}${#candidates[@]}${RESET} seed script(s):"
+  local i=1
+  for f in "${candidates[@]}"; do
+    echo -e "    ${CYAN}$i${RESET}) ${f#$PROJECT_ROOT/}"
+    ((i++))
+  done
+  echo -e "    ${CYAN}a${RESET}) Run ALL sequentially"
+  echo
+  local pick
+  pick=$(ask "Choice" "a")
+  local runner="npx --yes tsx"
+  command -v tsx >/dev/null && runner="tsx"
+  if [[ "$pick" == "a" || "$pick" == "A" ]]; then
+    for f in "${candidates[@]}"; do
+      echo -e "${CYAN}▶ ${runner} ${f#$PROJECT_ROOT/}${RESET}"
+      (cd "$PROJECT_ROOT" && $runner "$f") || { warn "Script failed: $f"; pause; return; }
+    done
+    ok "All seed scripts ran successfully."
+  elif [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#candidates[@]} )); then
+    local f="${candidates[$((pick-1))]}"
+    echo -e "${CYAN}▶ ${runner} ${f#$PROJECT_ROOT/}${RESET}"
+    (cd "$PROJECT_ROOT" && $runner "$f") && ok "Done." || warn "Script failed."
+  else
+    warn "Unknown choice"
+  fi
+  pause
 }
 
 # ------------------------------------------------------------

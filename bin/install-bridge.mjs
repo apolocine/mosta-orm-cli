@@ -30,11 +30,13 @@ const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(`--${name}`);
 const val  = (name) => { const i = argv.indexOf(`--${name}`); return i >= 0 ? argv[i + 1] : null; };
 
-const APPLY    = flag('apply');
-const RESTORE  = flag('restore');
-const ONE_FILE = val('file');
-const ROOT     = resolve(val('project') ?? process.cwd());
-const QUIET    = flag('quiet');
+const APPLY          = flag('apply');
+const RESTORE        = flag('restore');
+const RESTORE_SEEDS  = flag('restore-seeds');      // NEW : restore only seed-like .prisma.bak files
+const ONE_FILE       = val('file');
+const ROOT           = resolve(val('project') ?? process.cwd());
+const QUIET          = flag('quiet');
+const REWRITE_SEEDS  = flag('rewrite-seeds');      // NEW : force rewriting seed scripts (legacy behavior)
 
 const log = (...a) => { if (!QUIET) console.log(...a); };
 const c   = { cyan: s => `\x1b[36m${s}\x1b[0m`, yellow: s => `\x1b[33m${s}\x1b[0m`, green: s => `\x1b[32m${s}\x1b[0m`, red: s => `\x1b[31m${s}\x1b[0m`, bold: s => `\x1b[1m${s}\x1b[0m`, dim: s => `\x1b[2m${s}\x1b[0m` };
@@ -42,6 +44,17 @@ const c   = { cyan: s => `\x1b[36m${s}\x1b[0m`, yellow: s => `\x1b[33m${s}\x1b[0
 // ---------- Walk ----------
 const SKIP_DIRS = new Set(['node_modules', '.next', '.svelte-kit', 'dist', 'build', '.turbo', '.vercel', '.cache', 'coverage', '.git', '.vscode', '.idea']);
 const EXTENSIONS = new Set(['.ts', '.tsx', '.mts', '.js', '.jsx', '.mjs']);
+
+// Paths that look like seed SCRIPTS (not db modules). These must NOT be
+// rewritten — their `new PrismaClient()` is a local instance scoped to the
+// script, not a reusable export. Rewriting them turns the script into a
+// 2-line stub and destroys the seed logic.
+//
+// Heuristic : last path segment starts with `seed` or `seeder`, OR file sits
+// inside a `seeds/` or `fixtures/` directory, OR the path is Prisma's
+// canonical `prisma/seed.(ts|js)`.
+const RX_SEED_PATH = /(^|[\\\/])(seeds?|fixtures|seeders?)[\\\/]|(^|[\\\/])(seed[^\\\/]*|seeder[^\\\/]*)\.(ts|tsx|mts|js|jsx|mjs)$|(^|[\\\/])prisma[\\\/]seed\.(ts|tsx|mts|js|jsx|mjs)$/i;
+function looksLikeSeedScript(relPath) { return RX_SEED_PATH.test(relPath); }
 
 function* walk(dir) {
   let entries;
@@ -52,7 +65,8 @@ function* walk(dir) {
     let st;
     try { st = statSync(p); } catch { continue; }
     if (st.isDirectory()) yield* walk(p);
-    else if (EXTENSIONS.has(extname(name))) yield p;
+    // Source files we might rewrite, OR .prisma.bak we might restore.
+    else if (EXTENSIONS.has(extname(name)) || name.endsWith('.prisma.bak')) yield p;
   }
 }
 
@@ -113,16 +127,18 @@ function buildReplacement(shape) {
 }
 
 // ---------- Restore ----------
-function restoreBackups() {
+function restoreBackups({ onlySeeds = false } = {}) {
   const restored = [];
   for (const p of walk(ROOT)) {
     if (!p.endsWith('.prisma.bak')) continue;
     const original = p.slice(0, -'.prisma.bak'.length);
+    const rel = relative(ROOT, original);
+    if (onlySeeds && !looksLikeSeedScript(rel)) continue;
     if (APPLY) {
       renameSync(p, original);
-      log(`  ${c.green('✓')} restored ${c.dim(relative(ROOT, original))}`);
+      log(`  ${c.green('✓')} restored ${c.dim(rel)}`);
     } else {
-      log(`  ${c.yellow('•')} would restore ${c.dim(relative(ROOT, original))}`);
+      log(`  ${c.yellow('•')} would restore ${c.dim(rel)}`);
     }
     restored.push(original);
   }
@@ -130,6 +146,12 @@ function restoreBackups() {
 }
 
 // ---------- Main ----------
+if (RESTORE_SEEDS) {
+  log(c.bold('▶ Restoring seed-looking .prisma.bak files only' + (APPLY ? '' : c.yellow(' (dry-run, use --apply)'))));
+  const r = restoreBackups({ onlySeeds: true });
+  log(`\n${r.length} seed file(s) ${APPLY ? 'restored' : 'would be restored'}`);
+  process.exit(0);
+}
 if (RESTORE) {
   log(c.bold('▶ Restoring .prisma.bak files' + (APPLY ? '' : c.yellow(' (dry-run, use --apply)'))));
   const r = restoreBackups();
@@ -141,6 +163,7 @@ log(c.bold(`▶ mostajs install-bridge — scanning ${c.cyan(ROOT)}`));
 log('');
 
 const candidates = [];
+const skippedSeeds = [];
 const iter = ONE_FILE ? [resolve(ROOT, ONE_FILE)] : walk(ROOT);
 for (const p of iter) {
   let src;
@@ -151,12 +174,18 @@ for (const p of iter) {
     continue;
   }
   if (!RX_NEW.test(src)) continue;  // imports only = not an instantiation site
-  const shape = detectExportShape(src);
-  if (!shape) {
-    log(`  ${c.yellow('?')} ${relative(ROOT, p)} — PrismaClient detected but export shape unknown, skipping`);
+  const rel = relative(ROOT, p);
+  if (looksLikeSeedScript(rel) && !REWRITE_SEEDS) {
+    skippedSeeds.push(rel);
+    log(`  ${c.yellow('⚠ skip seed script')} ${c.dim(rel)}`);
     continue;
   }
-  candidates.push({ path: p, rel: relative(ROOT, p), shape, src });
+  const shape = detectExportShape(src);
+  if (!shape) {
+    log(`  ${c.yellow('?')} ${rel} — PrismaClient detected but export shape unknown, skipping`);
+    continue;
+  }
+  candidates.push({ path: p, rel, shape, src });
 }
 
 if (candidates.length === 0) {
@@ -170,6 +199,13 @@ if (candidates.length === 0) {
 log(c.bold(`Found ${candidates.length} PrismaClient instantiation site(s):`));
 for (const ca of candidates) {
   log(`  ${c.green('→')} ${ca.rel}  ${c.dim(`(${ca.shape.kind}${ca.shape.name ? ' ' + ca.shape.name : ''})`)}`);
+}
+if (skippedSeeds.length) {
+  log('');
+  log(c.yellow(`${skippedSeeds.length} seed script(s) were skipped (preserved as-is).`));
+  log(c.dim('  These files keep their original content. To run them with the bridge,'));
+  log(c.dim('  either:  (a) re-link @prisma/client,  (b) rewrite them with --rewrite-seeds,'));
+  log(c.dim('           (c) use the mostajs seed system (menu S) with JSON fixtures.'));
 }
 log('');
 
@@ -201,4 +237,5 @@ log(`  2. ${c.cyan('npx @mostajs/orm-cli')}  →  menu 1 (Convert Prisma → ent
 log(`  3. Set ${c.cyan('DB_DIALECT')} + ${c.cyan('SGBD_URI')} in .env (or: menu 2 → i to import)`);
 log(`  4. ${c.cyan('npm run dev')}  and test.`);
 log('');
-log(`To undo : ${c.cyan('mostajs install-bridge --restore --apply')}`);
+log(`To undo all         : ${c.cyan('mostajs install-bridge --restore --apply')}`);
+log(`To restore seeds    : ${c.cyan('mostajs install-bridge --restore-seeds --apply')}`);

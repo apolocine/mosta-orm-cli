@@ -2,6 +2,38 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.4.4] — 2026-04-14
+
+### Added — seed-aware codemod + new menu actions
+
+- **`install-bridge` skips seed scripts by default.** Files matching
+  `**/seeds/**`, `**/seeders/**`, `**/fixtures/**`, `**/seed-*.{ts,js}`,
+  `**/seeder-*.{ts,js}` or `prisma/seed.{ts,js}` are now **preserved** instead
+  of being rewritten to a 2-line `createPrismaLikeDb()` stub. These files are
+  usually standalone scripts that create their own Prisma client inline —
+  rewriting them destroys their logic.
+  ```bash
+  # legacy behavior (if you really want it)
+  mostajs install-bridge --apply --rewrite-seeds
+  ```
+- **`install-bridge --restore-seeds`** — restores only seed-like `.prisma.bak`
+  files. Useful when a previous run of `install-bridge` (pre-0.4.4) destroyed
+  your seed scripts :
+  ```bash
+  mostajs install-bridge --restore-seeds --apply
+  ```
+- **Menu S → r)** — interactive version of `--restore-seeds` with a dry-run
+  preview before applying.
+- **Menu S → s)** — **Run seed scripts**. Auto-detects `prisma/seed.ts`,
+  `scripts/seed.ts`, `scripts/seed-*.ts` (and `.js` variants) and runs them
+  with `tsx` (or `npx tsx`). Preserves the `a` option to run all sequentially.
+
+### Fixed
+
+- **`walk()` now yields `.prisma.bak` files** so `--restore` actually finds
+  backups to restore (the pre-0.4.4 version filtered by extension and
+  silently missed every `.bak`, leaving the feature non-functional).
+
 ## [0.4.3] — 2026-04-14
 
 ### Added
