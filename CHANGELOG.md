@@ -33,6 +33,11 @@ All notable changes to `@mostajs/orm-cli` will be documented in this file.
 - **`walk()` now yields `.prisma.bak` files** so `--restore` actually finds
   backups to restore (the pre-0.4.4 version filtered by extension and
   silently missed every `.bak`, leaving the feature non-functional).
+- **Seed validator recognises relation FK columns.** Fields declared via a
+  relation `joinColumn` (e.g. `User.profile → profileId`, `UserRole.user →
+  userId`) no longer trigger spurious `unknown field` warnings when present
+  in seed JSONs. The validator now accepts : explicit fields + relation
+  names + resolved `joinColumn` (or conventional `<relation>Id` fallback).
 
 ## [0.4.3] — 2026-04-14
 
