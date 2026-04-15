@@ -2115,29 +2115,14 @@ action_rep_add_rule() {
   target=$(ask   "Target project" "$src_default")
   mode=$(ask     "Mode (snapshot | cdc | bidirectional)" "cdc")
   echo
-  dim "  Collections : '*' = all tables in entities.json (full-DB replication)"
-  dim "                or explicit comma-separated list (User,Member,Payment)"
+  dim "  Collections : '*' = all tables of the master DB — resolved LIVE at"
+  dim "                each sync tick from the master's table catalogue"
+  dim "                (so new tables added later are picked up automatically)."
+  dim "                Or : explicit comma-separated list (User,Member,Payment)"
   colls=$(ask "Collections" "*")
   conflict=$(ask "Conflict resolution (source-wins | target-wins | timestamp)" "source-wins")
-
-  # Expand '*' into the full list of entity NAMES from entities.json. Keeps
-  # the tree self-contained — no special-case needed in replicator.mjs.
   if [[ "$colls" == "*" ]]; then
-    local ents_json="$GENERATED_DIR/entities.json"
-    if [[ -f "$ents_json" ]]; then
-      colls=$(node -e "try{const e=JSON.parse(require('fs').readFileSync('$ents_json','utf8'));console.log(e.map(x=>x.name).join(','))}catch{console.log('')}" 2>/dev/null)
-      if [[ -z "$colls" ]]; then
-        warn "  entities.json empty or unreadable — keeping '*' as wildcard placeholder"
-        colls="*"
-      else
-        local count; count=$(echo "$colls" | tr ',' '\n' | wc -l)
-        ok "  expanded '*' → ${count} tables from entities.json"
-        dim "     ${colls}"
-      fi
-    else
-      warn "  no entities.json found at $ents_json — keeping '*' as wildcard placeholder"
-      warn "     (run menu 1 'Convert' first, then re-add the rule to expand)"
-    fi
+    dim "  → '*' stored as-is ; replicator.mjs will introspect the master DB at run-time."
   fi
 
   _tree_patch "
