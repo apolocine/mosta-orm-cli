@@ -1962,41 +1962,53 @@ action_rep_add_replica() {
   else
     lag="0"
   fi
-  _replicator_run "
-    // Auto-register the project in ProjectManager if it's not already there —
-    // addReplica() requires the project to exist. We use the replica's own
-    // dialect/uri as the project config (it's typically the master).
-    const existing = typeof pm.listProjects === 'function' ? pm.listProjects() : [];
-    const known = Array.isArray(existing) && existing.some(p => (p.name ?? p) === '$project');
-    if (!known) {
-      const method = ['addProject','createProject','registerProject'].find(m => typeof pm[m] === 'function');
-      if (method) {
-        await pm[method]({ name: '$project', dialect: '$dialect', uri: '$uri', schemas: [] });
-        console.log('  ✓ project \\'$project\\' registered in ProjectManager');
-      }
-    }
-    await rm.addReplica('$project', {
-      name: '$name', role: '$role', dialect: '$dialect', uri: '$uri',
-      lagTolerance: $lag,
-    });
-    await save();
+  # Direct tree-JSON patch — preserves URI verbatim (no masking), no DB
+  # connection needed. Validation of the URI happens later when replicator
+  # service or sync action actually touches the DB.
+  _tree_patch "
+    tree.replicas['$project'] = tree.replicas['$project'] || {};
+    tree.replicas['$project']['$name'] = {
+      role: '$role',
+      dialect: '$dialect',
+      uri: '$uri',
+      pool: { min: 2, max: 20 },
+      ...( '$role' === 'slave' ? { lagTolerance: $lag } : {} ),
+    };
     console.log('  ✓ replica added : $name (' + '$role' + ') on project $project');
   "
   pause
 }
 
+# ----------------------------------------------------------------
+# Tree-file direct manipulation helpers
+# ----------------------------------------------------------------
+# The replicator's saveToFile() masks credentials (oracle://u:***@host)
+# which makes loadFromFile() unable to reconnect. For add/list/remove we
+# bypass the lib and patch the tree JSON directly, preserving the
+# original URI verbatim. The lib is still used for sync() / promote()
+# where it has logic beyond state tracking.
+
+_tree_file() { _replicator_tree_file; }
+
+_tree_read_json() {
+  # Dump the tree JSON on stdout, empty-tree fallback if file missing.
+  local tree_file
+  tree_file=$(_tree_file)
+  node -e "
+    const fs = require('fs');
+    const def = { replicas: {}, rules: {}, routing: {} };
+    try { console.log(JSON.stringify(Object.assign(def, JSON.parse(fs.readFileSync('$tree_file','utf8'))))); }
+    catch { console.log(JSON.stringify(def)); }
+  "
+}
+
 # List known projects from the replicator-tree.json — if any — and propose
 # the first one as default. Echoes the chosen project name to stdout.
-# Returns 1 if user cancelled.
 _pick_project() {
-  local tree_file
-  tree_file=$(_replicator_tree_file)
   local projects=()
-  if [[ -f "$tree_file" ]]; then
-    while IFS= read -r p; do projects+=("$p"); done < <(
-      node -e "try{const t=JSON.parse(require('fs').readFileSync('$tree_file','utf8'));for(const k of Object.keys(t.replicas||{}))console.log(k)}catch{}" 2>/dev/null
-    )
-  fi
+  while IFS= read -r p; do projects+=("$p"); done < <(
+    _tree_read_json | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{for(const k of Object.keys(JSON.parse(d).replicas||{}))console.log(k)})"
+  )
   local default_project="fitzone"
   if [[ ${#projects[@]} -gt 0 ]]; then
     default_project="${projects[0]}"
@@ -2010,18 +2022,46 @@ _pick_project() {
   echo "$picked"
 }
 
+# Patch the tree JSON : exec a Node snippet with `tree` in scope.
+# After the snippet runs, the mutated tree is written back.
+_tree_patch() {
+  local snippet="$1"
+  local tree_file
+  tree_file=$(_tree_file)
+  mkdir -p "$(dirname "$tree_file")"
+  TREE_FILE="$tree_file" node --input-type=module -e "
+    const { readFileSync, writeFileSync, existsSync } = await import('fs');
+    const { mkdirSync } = await import('fs');
+    const def = { replicas: {}, rules: {}, routing: {} };
+    let tree = def;
+    if (existsSync(process.env.TREE_FILE)) {
+      try { tree = Object.assign(def, JSON.parse(readFileSync(process.env.TREE_FILE, 'utf8'))); }
+      catch { /* start fresh */ }
+    }
+    try { $snippet }
+    catch (e) { console.error('  ✗ ' + e.message); process.exit(1); }
+    writeFileSync(process.env.TREE_FILE, JSON.stringify(tree, null, 2) + '\n');
+  "
+}
+
 action_rep_list_replicas() {
   local project
   project=$(_pick_project)
-  _replicator_run "
-    const status = rm.getReplicaStatus('$project');
-    if (!status || status.length === 0) {
-      console.log('  (no replicas registered for project $project)');
-    } else {
-      for (const r of status) {
-        console.log('  ' + (r.role === 'master' ? '★' : '•') + ' ' + r.name + ' [' + r.role + '] lag=' + (r.lag ?? 'n/a') + 'ms');
+  echo
+  _tree_read_json | PROJECT="$project" node -e "
+    let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+      const tree = JSON.parse(d);
+      const reps = tree.replicas[process.env.PROJECT] || {};
+      const entries = Object.entries(reps);
+      if (entries.length === 0) {
+        console.log('  (no replicas registered for project ' + process.env.PROJECT + ')');
+        return;
       }
-    }
+      for (const [name, cfg] of entries) {
+        const star = cfg.role === 'master' ? '\x1b[36m★\x1b[0m' : '•';
+        console.log('  ' + star + ' ' + name + '  [' + cfg.role + ']  ' + cfg.dialect + '  ' + (cfg.uri ?? '').replace(/:[^:@]+@/, ':***@'));
+      }
+    });
   "
   pause
 }
@@ -2044,10 +2084,14 @@ action_rep_remove_replica() {
   project=$(_pick_project)
   name=$(ask    "Replica name" "slave-1")
   if ! confirm "Remove replica '$name' from project '$project'?"; then return; fi
-  _replicator_run "
-    await rm.removeReplica('$project', '$name');
-    await save();
-    console.log('  ✓ removed : $name');
+  _tree_patch "
+    if (!tree.replicas['$project'] || !tree.replicas['$project']['$name']) {
+      console.log('  • not found : $project/$name');
+    } else {
+      delete tree.replicas['$project']['$name'];
+      if (Object.keys(tree.replicas['$project']).length === 0) delete tree.replicas['$project'];
+      console.log('  ✓ removed : $project/$name');
+    }
   "
   pause
 }
@@ -2056,9 +2100,8 @@ action_rep_set_routing() {
   local project strategy
   project=$(_pick_project)
   strategy=$(ask "Strategy (round-robin | least-lag | random)" "least-lag")
-  _replicator_run "
-    rm.setReadRouting('$project', '$strategy');
-    await save();
+  _tree_patch "
+    tree.routing['$project'] = '$strategy';
     console.log('  ✓ read routing on $project = $strategy');
   "
   pause
@@ -2066,36 +2109,41 @@ action_rep_set_routing() {
 
 action_rep_add_rule() {
   local name source target mode colls conflict
-  name=$(ask     "Rule name" "pg-to-mongo")
-  source=$(ask   "Source project" "secuaccess")
-  target=$(ask   "Target project" "analytics")
+  # Pick source/target from known projects
+  source=$(_pick_project)
+  local src_default="$source"
+  name=$(ask     "Rule name (short, e.g. 'pg-to-mongo')" "cdc-${src_default}")
+  target=$(ask   "Target project" "$src_default")
   mode=$(ask     "Mode (snapshot | cdc | bidirectional)" "cdc")
   colls=$(ask    "Collections (comma-separated)" "users,clients")
   conflict=$(ask "Conflict resolution (source-wins | target-wins | timestamp)" "source-wins")
-  _replicator_run "
-    rm.addReplicationRule({
-      name: '$name', source: '$source', target: '$target', mode: '$mode',
+  _tree_patch "
+    tree.rules['$name'] = {
+      source: '$source', target: '$target', mode: '$mode',
       collections: '$colls'.split(',').map(s => s.trim()).filter(Boolean),
       conflictResolution: '$conflict',
       enabled: true,
-    });
-    await save();
+    };
     console.log('  ✓ rule added : $name ($source → $target, mode=$mode)');
   "
   pause
 }
 
 action_rep_list_rules() {
-  _replicator_run "
-    const rules = rm.listRules();
-    if (!rules || rules.length === 0) {
-      console.log('  (no CDC rules registered)');
-    } else {
-      for (const r of rules) {
-        const flag = r.enabled ? '✓' : '✗';
-        console.log('  ' + flag + ' ' + r.name + '  ' + r.source + ' → ' + r.target + '  [' + r.mode + ']  ' + r.collections.join(','));
+  echo
+  _tree_read_json | node -e "
+    let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+      const tree = JSON.parse(d);
+      const rules = Object.entries(tree.rules || {});
+      if (rules.length === 0) {
+        console.log('  (no CDC rules registered)');
+        return;
       }
-    }
+      for (const [name, r] of rules) {
+        const flag = r.enabled ? '\x1b[32m✓\x1b[0m' : '\x1b[31m✗\x1b[0m';
+        console.log('  ' + flag + ' ' + name + '  ' + r.source + ' → ' + r.target + '  [' + r.mode + ']  ' + (r.collections||[]).join(','));
+      }
+    });
   "
   pause
 }
@@ -2119,10 +2167,13 @@ action_rep_remove_rule() {
   local name
   name=$(ask "Rule name" "pg-to-mongo")
   if ! confirm "Remove CDC rule '$name'?"; then return; fi
-  _replicator_run "
-    rm.removeReplicationRule('$name');
-    await save();
-    console.log('  ✓ removed : $name');
+  _tree_patch "
+    if (!tree.rules['$name']) {
+      console.log('  • not found : $name');
+    } else {
+      delete tree.rules['$name'];
+      console.log('  ✓ removed : $name');
+    }
   "
   pause
 }

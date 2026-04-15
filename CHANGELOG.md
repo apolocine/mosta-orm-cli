@@ -2,6 +2,33 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.5.6] — 2026-04-15
+
+### Fixed — state loss across menu actions
+
+Root cause : `ReplicationManager.saveToFile()` masks credentials in the
+tree JSON (`oracle://user:***@host`), and `loadFromFile()` can't then
+rebuild the live manager — every subsequent `getReplicaStatus()` returned
+an empty array, making it look like replicas had disappeared.
+
+Also : adding a slave with a dialect whose driver isn't installed
+(`better-sqlite3`, `oracledb`, etc.) threw at `addReplica()` time before
+state could be persisted, preventing experimental topologies from being
+saved.
+
+**Fix** : the menu no longer routes add/list/remove/set-routing/add-rule/
+remove-rule actions through the live `ReplicationManager`. Instead it
+reads and writes the tree JSON directly (via new `_tree_patch`
+helper), preserving URIs verbatim. The services (`replicator.mjs` +
+`monitor.mjs` scaffolded via menu `r → s`) still use the real lib for
+actual sync/monitoring work.
+
+Side benefits :
+- No DB driver required just to *register* a slave in the config
+- Credentials preserved (no masking) so `loadFromFile` in services can
+  reconnect — `.mostajs/replicator-tree.json` should be in `.gitignore`
+  (ensured by `mostajs init`).
+
 ## [0.5.5] — 2026-04-15
 
 ### Fixed — Replicator menu : smart project picker
