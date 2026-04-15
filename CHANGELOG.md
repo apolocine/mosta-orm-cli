@@ -2,6 +2,31 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.5.3] — 2026-04-15
+
+### Added — Menu `r → s) Scaffold services`
+
+One-shot bootstrap for background replicator + monitor processes :
+
+1. Calls `scaffoldReplicatorService()` from `@mostajs/replicator@0.2.0+` →
+   emits `services/replicator.mjs` (sync loop reading .env + tree.json).
+2. Calls `scaffoldMonitorService()` from `@mostajs/replica-monitor@0.2.0+` →
+   emits `services/monitor.mjs` (read-only tree-backed dashboard).
+3. Patches `package.json` scripts (only adds keys that don't already exist) :
+   - `replicator`  : `node services/replicator.mjs`
+   - `monitor`     : `node services/monitor.mjs`
+   - `dev:all`     : `concurrently --names next,rep,mon -c blue,magenta,cyan "npm:dev" "npm:replicator" "npm:monitor"`
+4. Installs `concurrently` as devDependency if missing (Braille spinner UX).
+
+After scaffold : `npm run dev:all` launches the three processes in parallel
+with coloured per-stream prefixes. Monitor opens on `http://localhost:14499`.
+
+### Design
+
+Each lib owns its own template — orm-cli is just the orchestrator. When a
+scaffolder evolves (new config, new env var), the emitted file moves in
+lockstep with the lib version.
+
 ## [0.5.2] — 2026-04-15
 
 ### Added

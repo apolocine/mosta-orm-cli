@@ -1799,6 +1799,7 @@ menu_replicator() {
   echo -e "  ${CYAN}8${RESET}) Run a CDC sync + show stats"
   echo -e "  ${CYAN}9${RESET}) Remove a CDC rule"
   echo -e "  ${CYAN}m${RESET}) ${BOLD}Open monitor${RESET} (live dashboard — localhost:14499)"
+  echo -e "  ${CYAN}s${RESET}) ${BOLD}Scaffold services${RESET} — services/replicator.mjs + services/monitor.mjs + package.json scripts"
   echo -e "  ${CYAN}v${RESET}) View the raw tree file"
   echo -e "  ${CYAN}c${RESET}) Clear (delete the tree file — DESTRUCTIVE)"
   echo
@@ -1817,12 +1818,118 @@ menu_replicator() {
     8) action_rep_sync ;;
     9) action_rep_remove_rule ;;
     m|M) action_rep_open_monitor ;;
+    s|S) action_rep_scaffold_services ;;
     v|V) action_rep_view_tree ;;
     c|C) action_rep_clear ;;
     b|B) return ;;
     *) warn "Unknown"; pause ;;
   esac
   menu_replicator
+}
+
+# ------------------------------------------------------------
+# Scaffold background services (replicator + monitor) + package.json patch
+# ------------------------------------------------------------
+action_rep_scaffold_services() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Scaffold background services${RESET}"
+  echo
+  echo -e "  This will :"
+  echo -e "    1. ${CYAN}services/replicator.mjs${RESET}  (from @mostajs/replicator)"
+  echo -e "    2. ${CYAN}services/monitor.mjs${RESET}     (from @mostajs/replica-monitor)"
+  echo -e "    3. patch ${CYAN}package.json${RESET} : scripts.replicator / monitor / dev:all"
+  echo -e "    4. install ${CYAN}concurrently${RESET} if missing"
+  echo
+  if ! confirm "Proceed?"; then return; fi
+
+  # Ensure the scaffolders' packages are installed locally
+  ensure_pkg "@mostajs/replicator" "@mostajs/replica-monitor" || { pause; return; }
+
+  local force_arg=""
+  if confirm "Overwrite existing services/*.mjs if present?"; then force_arg="--force"; fi
+
+  # Call each scaffolder (uses the lib's own emit logic — single source of truth)
+  echo
+  echo -e "${CYAN}▶ scaffoldReplicatorService${RESET}"
+  node --input-type=module -e "
+    const { scaffoldReplicatorService } = await import('${PROJECT_ROOT}/node_modules/@mostajs/replicator/dist/scaffold.js');
+    const r = scaffoldReplicatorService({ projectDir: '${PROJECT_ROOT}', force: ${force_arg:+true}${force_arg:-false} });
+    console.log('  ' + (r.wrote ? '✓' : '•') + ' ' + r.action + ' : ' + r.path);
+  " 2>&1 | sed 's/^/  /'
+
+  echo
+  echo -e "${CYAN}▶ scaffoldMonitorService${RESET}"
+  node --input-type=module -e "
+    const { scaffoldMonitorService } = await import('${PROJECT_ROOT}/node_modules/@mostajs/replica-monitor/dist/scaffold.js');
+    const r = scaffoldMonitorService({ projectDir: '${PROJECT_ROOT}', force: ${force_arg:+true}${force_arg:-false} });
+    console.log('  ' + (r.wrote ? '✓' : '•') + ' ' + r.action + ' : ' + r.path);
+  " 2>&1 | sed 's/^/  /'
+
+  # Patch package.json scripts
+  echo
+  echo -e "${CYAN}▶ patching package.json scripts${RESET}"
+  if [[ ! -f "$PROJECT_ROOT/package.json" ]]; then
+    warn "  no package.json found — skipping scripts patch"
+  else
+    PROJECT="$PROJECT_ROOT" node --input-type=module -e "
+      const fs = await import('node:fs');
+      const path = process.env.PROJECT + '/package.json';
+      const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+      pkg.scripts = pkg.scripts || {};
+      const add = (key, val) => {
+        if (pkg.scripts[key]) {
+          console.log('  • ' + key + ' already set (kept as-is)');
+        } else {
+          pkg.scripts[key] = val;
+          console.log('  ✓ added ' + key);
+        }
+      };
+      add('replicator', 'node services/replicator.mjs');
+      add('monitor',    'node services/monitor.mjs');
+      add('dev:all',    'concurrently --kill-others-on-fail --names next,rep,mon -c blue,magenta,cyan \"npm:dev\" \"npm:replicator\" \"npm:monitor\"');
+      fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+    " 2>&1 | sed 's/^/  /'
+  fi
+
+  # Ensure concurrently is installed (devDependency)
+  echo
+  echo -e "${CYAN}▶ checking concurrently${RESET}"
+  if [[ -d "$PROJECT_ROOT/node_modules/concurrently" ]]; then
+    ok "  concurrently already installed"
+  else
+    if confirm "Install concurrently as a devDependency?"; then
+      cd "$PROJECT_ROOT" || return 1
+      local log_file="/tmp/mostajs-concurrently-$$.log"
+      case "$PKG_MANAGER" in
+        pnpm) pnpm add -D concurrently > "$log_file" 2>&1 & ;;
+        yarn) yarn add -D concurrently > "$log_file" 2>&1 & ;;
+        bun)  bun add -d concurrently > "$log_file" 2>&1 & ;;
+        *)    npm install --save-dev concurrently --legacy-peer-deps > "$log_file" 2>&1 & ;;
+      esac
+      local pid=$! frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' tick=0
+      while kill -0 "$pid" 2>/dev/null; do
+        local f="${frames:$((tick % 10)):1}"
+        printf "\r  ${YELLOW}%s${RESET}  installing concurrently  ${DIM}(%ds)${RESET}    " "$f" "$((tick / 5))"
+        tick=$((tick + 1)); sleep 0.2
+      done
+      wait "$pid"; local rc=$?
+      printf "\r%60s\r" ""
+      if [[ $rc -eq 0 ]]; then ok "  concurrently installed"
+      else err "  install failed (see $log_file)"; tail -3 "$log_file"
+      fi
+      rm -f "$log_file"
+    fi
+  fi
+
+  echo
+  echo -e "${BOLD}${GREEN}✓ Scaffold complete.${RESET}"
+  echo
+  echo -e "  ${BOLD}Next steps :${RESET}"
+  echo -e "    1. ${CYAN}mostajs${RESET} → menu r → add replicas + CDC rules (writes replicator-tree.json)"
+  echo -e "    2. ${CYAN}npm run dev:all${RESET}   — starts Next + replicator + monitor in parallel"
+  echo -e "       or individually : ${CYAN}npm run replicator${RESET} / ${CYAN}npm run monitor${RESET}"
+  echo -e "    3. Open ${CYAN}http://localhost:14499${RESET} for the live dashboard"
+  pause
 }
 
 action_rep_add_replica() {
