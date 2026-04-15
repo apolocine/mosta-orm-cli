@@ -2,6 +2,16 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.4.6] — 2026-04-15
+
+### Fixed
+
+- **`ensure_pkg` now shows a live spinner** while npm/pnpm/yarn/bun installs
+  missing packages. Pre-0.4.6 the install ran inside `... 2>&1 | tail -5`,
+  which buffers all output until completion — leaving the user staring at
+  a blank line for 1-2 minutes with no feedback. Now a Braille spinner +
+  elapsed seconds tick every 200ms while the install runs in background.
+
 ## [0.4.5] — 2026-04-15
 
 ### Added — Drop table(s) action in seed menu

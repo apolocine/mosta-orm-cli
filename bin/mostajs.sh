@@ -98,13 +98,32 @@ ensure_pkg() {
   warn "Missing package(s): ${missing[*]}"
   if confirm "Install now with $PKG_MANAGER?"; then
     cd "$PROJECT_ROOT" || return 1
+    local log_file="/tmp/mostajs-install-$$.log"
     case "$PKG_MANAGER" in
-      pnpm) pnpm add "${missing[@]}" 2>&1 | tail -5 ;;
-      yarn) yarn add "${missing[@]}" 2>&1 | tail -5 ;;
-      bun)  bun add "${missing[@]}" 2>&1 | tail -5 ;;
-      *)    npm install --save "${missing[@]}" --legacy-peer-deps 2>&1 | tail -5 ;;
+      pnpm) pnpm add "${missing[@]}" >"$log_file" 2>&1 & ;;
+      yarn) yarn add "${missing[@]}" >"$log_file" 2>&1 & ;;
+      bun)  bun add "${missing[@]}" >"$log_file" 2>&1 & ;;
+      *)    npm install --save "${missing[@]}" --legacy-peer-deps >"$log_file" 2>&1 & ;;
     esac
-    local rc=${PIPESTATUS[0]}
+    local install_pid=$!
+    # Braille spinner — visual feedback while the install runs in background
+    local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local tick=0
+    while kill -0 "$install_pid" 2>/dev/null; do
+      local f="${frames:$((tick % 10)):1}"
+      local secs=$((tick / 5))
+      printf "\r  ${YELLOW}%s${RESET}  installing ${CYAN}%s${RESET}  ${DIM}(%ds)${RESET}    " \
+             "$f" "${missing[*]}" "$secs"
+      tick=$(( tick + 1 ))
+      sleep 0.2
+    done
+    wait "$install_pid"
+    local rc=$?
+    # Clear the spinner line
+    printf "\r%80s\r" ""
+    # Show the last lines of the install log (errors or summary)
+    tail -5 "$log_file"
+    rm -f "$log_file"
     if [[ $rc -ne 0 ]]; then
       err "Install failed"
       return $rc
