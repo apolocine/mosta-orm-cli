@@ -2109,14 +2109,37 @@ action_rep_set_routing() {
 
 action_rep_add_rule() {
   local name source target mode colls conflict
-  # Pick source/target from known projects
   source=$(_pick_project)
   local src_default="$source"
   name=$(ask     "Rule name (short, e.g. 'pg-to-mongo')" "cdc-${src_default}")
   target=$(ask   "Target project" "$src_default")
   mode=$(ask     "Mode (snapshot | cdc | bidirectional)" "cdc")
-  colls=$(ask    "Collections (comma-separated)" "users,clients")
+  echo
+  dim "  Collections : '*' = all tables in entities.json (full-DB replication)"
+  dim "                or explicit comma-separated list (User,Member,Payment)"
+  colls=$(ask "Collections" "*")
   conflict=$(ask "Conflict resolution (source-wins | target-wins | timestamp)" "source-wins")
+
+  # Expand '*' into the full list of entity NAMES from entities.json. Keeps
+  # the tree self-contained — no special-case needed in replicator.mjs.
+  if [[ "$colls" == "*" ]]; then
+    local ents_json="$GENERATED_DIR/entities.json"
+    if [[ -f "$ents_json" ]]; then
+      colls=$(node -e "try{const e=JSON.parse(require('fs').readFileSync('$ents_json','utf8'));console.log(e.map(x=>x.name).join(','))}catch{console.log('')}" 2>/dev/null)
+      if [[ -z "$colls" ]]; then
+        warn "  entities.json empty or unreadable — keeping '*' as wildcard placeholder"
+        colls="*"
+      else
+        local count; count=$(echo "$colls" | tr ',' '\n' | wc -l)
+        ok "  expanded '*' → ${count} tables from entities.json"
+        dim "     ${colls}"
+      fi
+    else
+      warn "  no entities.json found at $ents_json — keeping '*' as wildcard placeholder"
+      warn "     (run menu 1 'Convert' first, then re-add the rule to expand)"
+    fi
+  fi
+
   _tree_patch "
     tree.rules['$name'] = {
       source: '$source', target: '$target', mode: '$mode',
@@ -2124,7 +2147,7 @@ action_rep_add_rule() {
       conflictResolution: '$conflict',
       enabled: true,
     };
-    console.log('  ✓ rule added : $name ($source → $target, mode=$mode)');
+    console.log('  ✓ rule added : $name ($source → $target, mode=$mode, ' + ('$colls'.split(',').length) + ' collections)');
   "
   pause
 }

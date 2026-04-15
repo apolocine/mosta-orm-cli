@@ -2,6 +2,27 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.5.9] — 2026-04-15
+
+### Added — menu `r → 6` accepts `*` for full-DB replication
+
+Previously the user had to list every collection manually
+(`User,Member,Payment,…`). Now the prompt defaults to `*` which expands
+into the full list of entity names read from
+`.mostajs/generated/entities.json`. The tree.json stays self-contained
+(explicit list, not a wildcard) so the emitted `replicator.mjs` doesn't
+need any special-case handling — it iterates the same way whether you
+picked all 40 or just 2 entities.
+
+```
+? Collections  [*]:
+  ✓ expanded '*' → 40 tables from entities.json
+     User, Profile, Session, Member, Note, SubscriptionPlan, …
+```
+
+Fallback : if `entities.json` is missing or empty, the wildcard is kept
+as-is and a warning recommends running menu 1 (Convert) first.
+
 ## [0.5.8] — 2026-04-15
 
 ### Fixed — menu `r → s` scaffold crash on force-overwrite
