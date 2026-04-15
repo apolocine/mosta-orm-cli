@@ -1655,6 +1655,7 @@ menu_seeding() {
   echo -e "  ${CYAN}h${RESET}) ${BOLD}Hash plain-text passwords in seed files${RESET} (bcrypt)"
   echo -e "  ${CYAN}r${RESET}) ${BOLD}Restore seed scripts${RESET} from ${DIM}*.prisma.bak${RESET} (undo install-bridge on seeds)"
   echo -e "  ${CYAN}s${RESET}) ${BOLD}Run seed scripts${RESET} (${DIM}scripts/seed-*.ts | prisma/seed.ts${RESET}) via tsx"
+  echo -e "  ${RED}d${RESET}) ${BOLD}Drop table(s)${RESET} — pick one / many / all, then DROP TABLE (DESTRUCTIVE)"
   echo
   echo -e "  ${CYAN}b${RESET}) Back"
   echo
@@ -1673,10 +1674,110 @@ menu_seeding() {
     h|H) action_seed_hash_passwords ;;
     r|R) action_seed_restore_scripts ;;
     s|S) action_seed_run_scripts ;;
+    d|D) action_drop_tables ;;
     b|B) return ;;
     *) warn "Unknown"; pause ;;
   esac
   menu_seeding
+}
+
+# ------------------------------------------------------------
+# seed : drop tables (interactive picker)
+# ------------------------------------------------------------
+action_drop_tables() {
+  header
+  echo -e "${BOLD}${RED}▶ Drop table(s) — DESTRUCTIVE${RESET}"
+  echo
+  load_env
+  local seed_dir="$CONFIG_DIR/seeds"
+  local entities_json="$GENERATED_DIR/entities.json"
+  if [[ ! -f "$entities_json" ]]; then
+    warn "No entities.json found at $entities_json — run menu 1 (Convert) first."
+    pause; return
+  fi
+
+  # Run a Node helper that lists live tables, lets the user pick, then drops via dialect
+  node --input-type=module -e "
+    import { readFileSync } from 'node:fs';
+    import { createInterface } from 'node:readline/promises';
+    import { stdin, stdout } from 'node:process';
+    import { getDialect } from '${PROJECT_ROOT}/node_modules/@mostajs/orm/dist/index.js';
+
+    const env = readFileSync('${PROJECT_ROOT}/.mostajs/config.env', 'utf8');
+    for (const line of env.split('\n')) {
+      const [k, v] = line.split('=');
+      if (k && v) process.env[k.trim()] = v.trim();
+    }
+
+    const entities = JSON.parse(readFileSync('${PROJECT_ROOT}/.mostajs/generated/entities.json', 'utf8'));
+    const tableSet = new Set(entities.map(e => e.collection));
+    // Add junction tables (many-to-many.through)
+    for (const e of entities) {
+      for (const r of Object.values(e.relations || {})) {
+        if (r && r.type === 'many-to-many' && r.through) tableSet.add(r.through);
+      }
+    }
+
+    const d = await getDialect({
+      dialect: process.env.DB_DIALECT,
+      uri:     process.env.SGBD_URI,
+      schemaStrategy: 'none',
+    });
+
+    // Try to list live tables (dialects that expose getTableListQuery via internal call)
+    let live = [];
+    try {
+      const sql = d.getTableListQuery && d.getTableListQuery();
+      if (sql) {
+        const rows = await d.executeQuery(sql, []);
+        live = rows.map(r => r.name || r.TABLE_NAME || r.table_name || Object.values(r)[0]).filter(Boolean);
+      }
+    } catch {}
+    // Intersect with schema-known tables (only show ones we own)
+    const owned = (live.length ? live : Array.from(tableSet)).filter(t => tableSet.has(t)).sort();
+
+    if (owned.length === 0) {
+      console.log('  No tables found that match this project\'s entities.');
+      await d.disconnect();
+      process.exit(0);
+    }
+
+    console.log('  Live tables in this project :');
+    owned.forEach((t, i) => console.log('    ' + (i + 1).toString().padStart(2) + ') ' + t));
+    console.log('    a) ALL of the above');
+    console.log('    q) Cancel');
+
+    const rl = createInterface({ input: stdin, output: stdout });
+    const pick = (await rl.question('  Pick (number, comma-separated, or a) : ')).trim();
+    if (!pick || pick.toLowerCase() === 'q') { rl.close(); await d.disconnect(); console.log('  Cancelled.'); process.exit(0); }
+
+    const targets = pick.toLowerCase() === 'a'
+      ? owned
+      : pick.split(',').map(s => s.trim()).map(s => owned[parseInt(s, 10) - 1]).filter(Boolean);
+
+    if (targets.length === 0) { rl.close(); await d.disconnect(); console.log('  Nothing to drop.'); process.exit(0); }
+
+    console.log('  About to DROP : ' + targets.join(', '));
+    const confirm = (await rl.question('  Type DROP to confirm : ')).trim();
+    rl.close();
+    if (confirm !== 'DROP') { await d.disconnect(); console.log('  Aborted.'); process.exit(0); }
+
+    let ok = 0, fail = 0;
+    for (const t of targets) {
+      try {
+        await d.dropTable(t);
+        console.log('  ✓ dropped ' + t);
+        ok++;
+      } catch (e) {
+        console.error('  ✗ ' + t + ' : ' + (e.message ?? e));
+        fail++;
+      }
+    }
+    await d.disconnect();
+    console.log('\nDropped : ' + ok + ' · failed : ' + fail);
+  " 2>&1
+  echo
+  pause
 }
 
 # ------------------------------------------------------------

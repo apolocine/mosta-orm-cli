@@ -2,6 +2,19 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.4.5] — 2026-04-15
+
+### Added — Drop table(s) action in seed menu
+
+- **Menu S → d) Drop table(s)** — interactive picker that lists the live
+  tables (intersected with the project's entities — junction tables
+  included), lets the user pick one / many / all, asks for explicit
+  `DROP` typing as confirmation, then issues `dialect.dropTable()` for
+  each. Useful when a legacy schema has incompatible NOT NULL columns
+  that ALTER cannot reconcile (e.g. the `users.firstName` Prisma legacy
+  refactored out of the new schema). Drop + menu 3 (init) recreates the
+  table cleanly so menu S → 4 (apply) succeeds.
+
 ## [0.4.4] — 2026-04-14
 
 ### Added — seed-aware codemod + new menu actions
