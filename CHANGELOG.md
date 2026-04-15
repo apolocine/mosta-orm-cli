@@ -2,6 +2,31 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.5.1] — 2026-04-15
+
+### Added — Replicator menu (`r`)
+
+- **Menu `r) Replicator`** — thin CLI wrapper around
+  [`@mostajs/replicator`](https://www.npmjs.com/package/@mostajs/replicator).
+  State is persisted to `.mostajs/replicator-tree.json` (auto-loaded at menu
+  start, auto-saved after each mutating action).
+- Actions exposed :
+  1. **Add replica** (master / slave) to a project (dialect, URI, pool,
+     lag tolerance).
+  2. **List replicas** with role + live lag.
+  3. **Promote a slave to master** (failover).
+  4. **Remove a replica**.
+  5. **Set read-routing strategy** (`round-robin` / `least-lag` / `random`).
+  6. **Add CDC rule** (source → target, mode `snapshot` / `cdc` /
+     `bidirectional`, collections, conflict resolution).
+  7. **List CDC rules**.
+  8. **Run a CDC sync** + show stats (inserted / updated / deleted / failed).
+  9. **Remove a CDC rule**.
+  - **`v`** view the raw tree file (pretty-printed with `jq` when available).
+  - **`c`** clear (delete tree file — destructive, confirms).
+- Auto-installs `@mostajs/replicator` + `@mostajs/mproject` if missing
+  (uses the existing `ensure_pkg` Braille spinner UX from 0.4.6).
+
 ## [0.5.0] — 2026-04-15
 
 ### Added — `mostajs init` + `mostajs migrate` subcommands (Sprint 3)

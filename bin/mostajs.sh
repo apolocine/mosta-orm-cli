@@ -467,6 +467,7 @@ menu_main() {
   echo -e "  ${CYAN}9${RESET}) Generate boilerplate (src/db.ts with bridge)"
   echo -e "  ${CYAN}s${RESET}) ${BOLD}Seeding${RESET} (upload / validate / apply seed data)"
   echo -e "  ${CYAN}e${RESET}) ${BOLD}Export entities${RESET} → Prisma / JSON Schema / OpenAPI / Native"
+  echo -e "  ${CYAN}r${RESET}) ${BOLD}Replicator${RESET} — CQRS master/slave, CDC rules, failover"
   echo -e "  ${GREEN}b${RESET}) ${BOLD}Bootstrap${RESET} — one-shot migration of a Prisma project"
   echo -e "  ${GREEN}i${RESET}) ${BOLD}Install bridge${RESET} — codemod PrismaClient → bridge (dry-run / apply / restore)"
   echo -e "  ${CYAN}0${RESET}) About / Help"
@@ -487,6 +488,7 @@ menu_main() {
     9) action_generate_boilerplate ;;
     s|S) menu_seeding ;;
     e|E) action_export_entities ;;
+    r|R) menu_replicator ;;
     b|B) menu_bootstrap ;;
     i|I) menu_install_bridge ;;
     0) action_about ;;
@@ -1709,6 +1711,282 @@ menu_seeding() {
     *) warn "Unknown"; pause ;;
   esac
   menu_seeding
+}
+
+# ------------------------------------------------------------
+# Replicator menu — CQRS master/slave + cross-dialect CDC
+# ------------------------------------------------------------
+#
+# Thin wrapper around @mostajs/replicator. Every action is routed to
+# ReplicationManager methods via a Node --input-type=module shell.
+# State is persisted to $PROJECT_ROOT/.mostajs/replicator-tree.json
+# (same file format as saveToFile / loadFromFile of the lib).
+
+_replicator_tree_file() {
+  echo "$PROJECT_ROOT/.mostajs/replicator-tree.json"
+}
+
+_replicator_has_lib() {
+  [[ -d "$PROJECT_ROOT/node_modules/@mostajs/replicator" ]]
+}
+
+_replicator_run() {
+  # Execute a Node snippet with the replicator loaded. The snippet reads
+  # from stdin, gets `rm` (ReplicationManager), `pm` (ProjectManager) in
+  # scope and is expected to mutate them then call `await save()`.
+  # $1 = inline snippet string.
+  local tree_file
+  tree_file=$(_replicator_tree_file)
+  mkdir -p "$(dirname "$tree_file")"
+  TREE_FILE="$tree_file" RUNTIME_ROOT="$PROJECT_ROOT" \
+  node --input-type=module -e "
+    const { existsSync } = await import('fs');
+    const { ReplicationManager } = await import(process.env.RUNTIME_ROOT + '/node_modules/@mostajs/replicator/dist/index.js');
+    const { ProjectManager }     = await import(process.env.RUNTIME_ROOT + '/node_modules/@mostajs/mproject/dist/index.js');
+    const pm = new ProjectManager();
+    const rm = new ReplicationManager(pm);
+    const save = async () => { await rm.saveToFile(process.env.TREE_FILE); };
+    if (existsSync(process.env.TREE_FILE)) {
+      try { await rm.loadFromFile(process.env.TREE_FILE); } catch (e) { console.error('  ⚠ load failed : ' + e.message); }
+    }
+    try {
+      $1
+    } catch (e) {
+      console.error('  ✗ ' + e.message);
+      process.exit(1);
+    } finally {
+      try { await rm.disconnectAll(); } catch {}
+    }
+  "
+}
+
+menu_replicator() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Replicator — CQRS, CDC, failover${RESET}"
+  echo
+  if ! _replicator_has_lib; then
+    warn "@mostajs/replicator not installed in this project."
+    echo
+    if confirm "Install @mostajs/replicator + @mostajs/mproject now?"; then
+      ensure_pkg "@mostajs/replicator" "@mostajs/mproject" || { pause; return; }
+    else
+      dim "  Cannot proceed without the replicator lib."
+      pause; return
+    fi
+  fi
+
+  local tree_file
+  tree_file=$(_replicator_tree_file)
+  echo -e "  Tree file : ${DIM}${tree_file}${RESET}"
+  if [[ -f "$tree_file" ]]; then
+    local projects
+    projects=$(node -e "try{const t=JSON.parse(require('fs').readFileSync('$tree_file','utf8'));console.log(Object.keys(t.replicas||{}).length+' projects, '+Object.keys(t.rules||{}).length+' CDC rules')}catch{console.log('?')}" 2>/dev/null)
+    echo -e "  State     : ${DIM}${projects}${RESET}"
+  else
+    echo -e "  State     : ${DIM}(empty — will be created on first save)${RESET}"
+  fi
+
+  echo
+  echo -e "${BOLD}━━━ REPLICATOR MENU ━━━${RESET}"
+  echo
+  echo -e "  ${CYAN}1${RESET}) Add replica (master / slave) to a project"
+  echo -e "  ${CYAN}2${RESET}) List replicas + status / lag"
+  echo -e "  ${CYAN}3${RESET}) Promote a slave to master (failover)"
+  echo -e "  ${CYAN}4${RESET}) Remove a replica"
+  echo -e "  ${CYAN}5${RESET}) Set read-routing strategy (round-robin / least-lag / random)"
+  echo -e "  ${CYAN}6${RESET}) Add a CDC rule (pg → mongo, mysql → analytics, …)"
+  echo -e "  ${CYAN}7${RESET}) List CDC rules"
+  echo -e "  ${CYAN}8${RESET}) Run a CDC sync + show stats"
+  echo -e "  ${CYAN}9${RESET}) Remove a CDC rule"
+  echo -e "  ${CYAN}v${RESET}) View the raw tree file"
+  echo -e "  ${CYAN}c${RESET}) Clear (delete the tree file — DESTRUCTIVE)"
+  echo
+  echo -e "  ${CYAN}b${RESET}) Back"
+  echo
+  local choice
+  choice=$(ask "Choice" "2")
+  case "$choice" in
+    1) action_rep_add_replica ;;
+    2) action_rep_list_replicas ;;
+    3) action_rep_promote ;;
+    4) action_rep_remove_replica ;;
+    5) action_rep_set_routing ;;
+    6) action_rep_add_rule ;;
+    7) action_rep_list_rules ;;
+    8) action_rep_sync ;;
+    9) action_rep_remove_rule ;;
+    v|V) action_rep_view_tree ;;
+    c|C) action_rep_clear ;;
+    b|B) return ;;
+    *) warn "Unknown"; pause ;;
+  esac
+  menu_replicator
+}
+
+action_rep_add_replica() {
+  local project name role dialect uri lag
+  project=$(ask "Project name" "default")
+  name=$(ask    "Replica name" "master")
+  role=$(ask    "Role (master|slave)" "master")
+  dialect=$(ask "Dialect" "${DB_DIALECT:-postgres}")
+  uri=$(ask     "URI" "${SGBD_URI:-postgres://user:pass@localhost:5432/db}")
+  if [[ "$role" == "slave" ]]; then
+    lag=$(ask "Lag tolerance (ms)" "5000")
+  else
+    lag="0"
+  fi
+  _replicator_run "
+    await rm.addReplica('$project', {
+      name: '$name', role: '$role', dialect: '$dialect', uri: '$uri',
+      lagTolerance: $lag,
+    });
+    await save();
+    console.log('  ✓ replica added : $name (' + '$role' + ') on project $project');
+  "
+  pause
+}
+
+action_rep_list_replicas() {
+  local project
+  project=$(ask "Project name" "default")
+  _replicator_run "
+    const status = rm.getReplicaStatus('$project');
+    if (!status || status.length === 0) {
+      console.log('  (no replicas registered for project $project)');
+    } else {
+      for (const r of status) {
+        console.log('  ' + (r.role === 'master' ? '★' : '•') + ' ' + r.name + ' [' + r.role + '] lag=' + (r.lag ?? 'n/a') + 'ms');
+      }
+    }
+  "
+  pause
+}
+
+action_rep_promote() {
+  local project name
+  project=$(ask "Project name" "default")
+  name=$(ask    "Slave to promote" "slave-1")
+  if ! confirm "Promote '$name' to master on project '$project'?"; then return; fi
+  _replicator_run "
+    await rm.promoteToMaster('$project', '$name');
+    await save();
+    console.log('  ✓ $name is now the master of $project');
+  "
+  pause
+}
+
+action_rep_remove_replica() {
+  local project name
+  project=$(ask "Project name" "default")
+  name=$(ask    "Replica name" "slave-1")
+  if ! confirm "Remove replica '$name' from project '$project'?"; then return; fi
+  _replicator_run "
+    await rm.removeReplica('$project', '$name');
+    await save();
+    console.log('  ✓ removed : $name');
+  "
+  pause
+}
+
+action_rep_set_routing() {
+  local project strategy
+  project=$(ask "Project name" "default")
+  strategy=$(ask "Strategy (round-robin | least-lag | random)" "least-lag")
+  _replicator_run "
+    rm.setReadRouting('$project', '$strategy');
+    await save();
+    console.log('  ✓ read routing on $project = $strategy');
+  "
+  pause
+}
+
+action_rep_add_rule() {
+  local name source target mode colls conflict
+  name=$(ask     "Rule name" "pg-to-mongo")
+  source=$(ask   "Source project" "secuaccess")
+  target=$(ask   "Target project" "analytics")
+  mode=$(ask     "Mode (snapshot | cdc | bidirectional)" "cdc")
+  colls=$(ask    "Collections (comma-separated)" "users,clients")
+  conflict=$(ask "Conflict resolution (source-wins | target-wins | timestamp)" "source-wins")
+  _replicator_run "
+    rm.addReplicationRule({
+      name: '$name', source: '$source', target: '$target', mode: '$mode',
+      collections: '$colls'.split(',').map(s => s.trim()).filter(Boolean),
+      conflictResolution: '$conflict',
+      enabled: true,
+    });
+    await save();
+    console.log('  ✓ rule added : $name ($source → $target, mode=$mode)');
+  "
+  pause
+}
+
+action_rep_list_rules() {
+  _replicator_run "
+    const rules = rm.listRules();
+    if (!rules || rules.length === 0) {
+      console.log('  (no CDC rules registered)');
+    } else {
+      for (const r of rules) {
+        const flag = r.enabled ? '✓' : '✗';
+        console.log('  ' + flag + ' ' + r.name + '  ' + r.source + ' → ' + r.target + '  [' + r.mode + ']  ' + r.collections.join(','));
+      }
+    }
+  "
+  pause
+}
+
+action_rep_sync() {
+  local rule
+  rule=$(ask "Rule name" "pg-to-mongo")
+  _replicator_run "
+    const stats = await rm.sync('$rule');
+    console.log('  ✓ sync complete');
+    console.log('    inserted: ' + (stats.inserted ?? 0));
+    console.log('    updated : ' + (stats.updated  ?? 0));
+    console.log('    deleted : ' + (stats.deleted  ?? 0));
+    console.log('    failed  : ' + (stats.failed   ?? 0));
+    await save();
+  "
+  pause
+}
+
+action_rep_remove_rule() {
+  local name
+  name=$(ask "Rule name" "pg-to-mongo")
+  if ! confirm "Remove CDC rule '$name'?"; then return; fi
+  _replicator_run "
+    rm.removeReplicationRule('$name');
+    await save();
+    console.log('  ✓ removed : $name');
+  "
+  pause
+}
+
+action_rep_view_tree() {
+  local tree_file
+  tree_file=$(_replicator_tree_file)
+  if [[ -f "$tree_file" ]]; then
+    echo -e "${DIM}${tree_file}${RESET}"
+    echo
+    if command -v jq >/dev/null 2>&1; then
+      jq . "$tree_file"
+    else
+      cat "$tree_file"
+    fi
+  else
+    warn "No tree file yet at $tree_file"
+  fi
+  pause
+}
+
+action_rep_clear() {
+  local tree_file
+  tree_file=$(_replicator_tree_file)
+  if ! confirm "DELETE the replicator tree file ($tree_file)?"; then return; fi
+  rm -f "$tree_file"
+  ok "  tree file deleted"
+  pause
 }
 
 # ------------------------------------------------------------
