@@ -2,6 +2,23 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.5.4] — 2026-04-15
+
+### Fixed — Menu `r → 1` (Add replica) UX
+
+- **Clearer prompts.** The previous prompts ("Project name", "Replica name")
+  were ambiguous — a user reported typing a full URI into the project name
+  and hitting `Projet "…" introuvable dans ProjectManager`.
+  Prompts now include hints and examples, and the dialect prompt lists the
+  13 supported options inline.
+- **Auto-register the project.** `rm.addReplica('fitzone', …)` requires the
+  project to exist in `ProjectManager` — previously the user had to run
+  something else first. The CLI now calls `pm.addProject({ name, dialect,
+  uri, schemas: [] })` behind the scenes when the project is missing, using
+  the replica's own dialect/uri as the baseline config (typically the master).
+- **Basic input validation** rejects project/replica names that look like
+  URIs or paths.
+
 ## [0.5.3] — 2026-04-15
 
 ### Added — Menu `r → s) Scaffold services`

@@ -1933,18 +1933,47 @@ action_rep_scaffold_services() {
 }
 
 action_rep_add_replica() {
+  echo
+  dim "  A project is a logical group of replicas (e.g. 'fitzone', 'secuaccess')."
+  dim "  Use a SHORT IDENTIFIER here (NOT a database URI — the URI comes later)."
+  echo
   local project name role dialect uri lag
-  project=$(ask "Project name" "default")
-  name=$(ask    "Replica name" "master")
+  project=$(ask "Project name (short id, e.g. 'fitzone')" "fitzone")
+  # Basic validation : reject URIs or paths
+  if [[ "$project" == *"://"* || "$project" == *"/"* ]]; then
+    err "  Project name looks like a URI or path. Use a short identifier (e.g. 'fitzone')."
+    pause; return
+  fi
+
+  echo
+  dim "  Replica name is a label inside the project (e.g. 'master-oracle', 'slave-pg')."
+  name=$(ask    "Replica name (label, e.g. 'master-oracle')" "master")
+  if [[ "$name" == *"://"* ]]; then
+    err "  Replica name looks like a URI. Use a short label."
+    pause; return
+  fi
+
   role=$(ask    "Role (master|slave)" "master")
-  dialect=$(ask "Dialect" "${DB_DIALECT:-postgres}")
-  uri=$(ask     "URI" "${SGBD_URI:-postgres://user:pass@localhost:5432/db}")
+  dialect=$(ask "Dialect (sqlite|postgres|mysql|mongodb|oracle|mssql|mariadb|cockroachdb|db2|hana|hsqldb|spanner|sybase)" "${DB_DIALECT:-postgres}")
+  uri=$(ask     "Connection URI" "${SGBD_URI:-postgres://user:pass@localhost:5432/db}")
   if [[ "$role" == "slave" ]]; then
     lag=$(ask "Lag tolerance (ms)" "5000")
   else
     lag="0"
   fi
   _replicator_run "
+    // Auto-register the project in ProjectManager if it's not already there —
+    // addReplica() requires the project to exist. We use the replica's own
+    // dialect/uri as the project config (it's typically the master).
+    const existing = typeof pm.listProjects === 'function' ? pm.listProjects() : [];
+    const known = Array.isArray(existing) && existing.some(p => (p.name ?? p) === '$project');
+    if (!known) {
+      const method = ['addProject','createProject','registerProject'].find(m => typeof pm[m] === 'function');
+      if (method) {
+        await pm[method]({ name: '$project', dialect: '$dialect', uri: '$uri', schemas: [] });
+        console.log('  ✓ project \\'$project\\' registered in ProjectManager');
+      }
+    }
     await rm.addReplica('$project', {
       name: '$name', role: '$role', dialect: '$dialect', uri: '$uri',
       lagTolerance: $lag,
