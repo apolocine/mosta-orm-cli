@@ -2,6 +2,19 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.5.8] — 2026-04-15
+
+### Fixed — menu `r → s` scaffold crash on force-overwrite
+
+Bash `${var:+true}${var:-false}` substitution produced `true--force` when
+the user answered "yes" to "Overwrite existing services/*.mjs?", which
+generated invalid JavaScript (`force: true--force`) → both scaffolders
+threw SyntaxError. `services/*.mjs` were never written, then `dev:all`
+crashed with `MODULE_NOT_FOUND`.
+
+Now the shell passes `FORCE=true|false` via env var to the Node snippet,
+and the snippet uses `process.env.FORCE === 'true'`.
+
 ## [0.5.7] — 2026-04-15
 
 ### Fixed — menu `r → m` proposes restart when a monitor is already running

@@ -1845,23 +1845,23 @@ action_rep_scaffold_services() {
   # Ensure the scaffolders' packages are installed locally
   ensure_pkg "@mostajs/replicator" "@mostajs/replica-monitor" || { pause; return; }
 
-  local force_arg=""
-  if confirm "Overwrite existing services/*.mjs if present?"; then force_arg="--force"; fi
+  local force_js="false"
+  if confirm "Overwrite existing services/*.mjs if present?"; then force_js="true"; fi
 
   # Call each scaffolder (uses the lib's own emit logic — single source of truth)
   echo
   echo -e "${CYAN}▶ scaffoldReplicatorService${RESET}"
-  node --input-type=module -e "
-    const { scaffoldReplicatorService } = await import('${PROJECT_ROOT}/node_modules/@mostajs/replicator/dist/scaffold.js');
-    const r = scaffoldReplicatorService({ projectDir: '${PROJECT_ROOT}', force: ${force_arg:+true}${force_arg:-false} });
+  FORCE="$force_js" PROJECT="$PROJECT_ROOT" node --input-type=module -e "
+    const { scaffoldReplicatorService } = await import(process.env.PROJECT + '/node_modules/@mostajs/replicator/dist/scaffold.js');
+    const r = scaffoldReplicatorService({ projectDir: process.env.PROJECT, force: process.env.FORCE === 'true' });
     console.log('  ' + (r.wrote ? '✓' : '•') + ' ' + r.action + ' : ' + r.path);
   " 2>&1 | sed 's/^/  /'
 
   echo
   echo -e "${CYAN}▶ scaffoldMonitorService${RESET}"
-  node --input-type=module -e "
-    const { scaffoldMonitorService } = await import('${PROJECT_ROOT}/node_modules/@mostajs/replica-monitor/dist/scaffold.js');
-    const r = scaffoldMonitorService({ projectDir: '${PROJECT_ROOT}', force: ${force_arg:+true}${force_arg:-false} });
+  FORCE="$force_js" PROJECT="$PROJECT_ROOT" node --input-type=module -e "
+    const { scaffoldMonitorService } = await import(process.env.PROJECT + '/node_modules/@mostajs/replica-monitor/dist/scaffold.js');
+    const r = scaffoldMonitorService({ projectDir: process.env.PROJECT, force: process.env.FORCE === 'true' });
     console.log('  ' + (r.wrote ? '✓' : '•') + ' ' + r.action + ' : ' + r.path);
   " 2>&1 | sed 's/^/  /'
 
