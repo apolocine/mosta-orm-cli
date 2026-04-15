@@ -2203,10 +2203,27 @@ action_rep_open_monitor() {
   local log_file="$PROJECT_ROOT/.mostajs/monitor.log"
   local pid_file="$PROJECT_ROOT/.mostajs/monitor.pid"
 
-  # If already running (pid file exists + process alive) : just open the URL.
+  # If already running : propose to restart (pick up tree changes with
+  # the new tree-only CLI). A stale instance from before 0.2.0 sees an
+  # empty state even when the tree has replicas.
   if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
-    ok "Monitor already running at http://127.0.0.1:${port}"
-  else
+    local old_pid
+    old_pid=$(cat "$pid_file")
+    dim "  Monitor already running (pid=$old_pid) at http://127.0.0.1:${port}"
+    if confirm "Restart it now? (picks up recent tree-file changes)"; then
+      kill "$old_pid" 2>/dev/null || true
+      sleep 0.5
+      rm -f "$pid_file"
+    else
+      ok "  Kept running — re-opening the URL"
+      if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "http://127.0.0.1:${port}${url_suffix}" >/dev/null 2>&1 &
+      fi
+      pause; return
+    fi
+  fi
+
+  if [[ ! -f "$pid_file" ]]; then
     # Spawn in background
     echo -e "  ${DIM}spawning mostajs-monitor …${RESET}"
     MONITOR_TREE="$tree_file" MONITOR_PORT="$port" MONITOR_TOKEN="$token" \

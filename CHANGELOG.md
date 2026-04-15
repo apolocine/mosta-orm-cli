@@ -2,6 +2,22 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.5.7] — 2026-04-15
+
+### Fixed — menu `r → m` proposes restart when a monitor is already running
+
+Previously the menu printed `Monitor already running at …` and returned,
+leaving the user stuck with an old (possibly pre-0.2.0) monitor process
+showing a stale / empty dashboard. Now the user is prompted :
+
+```
+Monitor already running (pid=12345) at http://127.0.0.1:14499
+? Restart it now? (picks up recent tree-file changes) [y/N]:
+```
+
+Answering `y` kills the old process and spawns a fresh one against the
+latest tree. `n` keeps the existing instance and just re-opens the URL.
+
 ## [0.5.6] — 2026-04-15
 
 ### Fixed — state loss across menu actions
