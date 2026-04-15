@@ -2,6 +2,47 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.5.0] — 2026-04-15
+
+### Added — `mostajs init` + `mostajs migrate` subcommands (Sprint 3)
+
+- **`mostajs init [--dialect sqlite|postgres|…] [--uri URI] [--force]`**
+  Scaffolds a fresh bridge-ready project in PROJECT_ROOT :
+  - `.env`  (PORT=3000, DB_DIALECT, SGBD_URI, DB_SCHEMA_STRATEGY, NEXTAUTH_URL,
+    AUTH_SECRET auto-generated via `crypto.randomBytes`)
+  - `.mostajs/config.env`  (mirror consumed by the seed-runner)
+  - `.mostajs/generated/entities.json`  (empty array, filled by menu 1)
+  - `prisma/schema.prisma`  (minimal `User` model — provider auto-mapped :
+    `postgres → postgresql`, `mssql → sqlserver`, `mariadb → mysql`)
+  - `src/lib/db.ts`  (the 3-line `createPrismaLikeDb` bridge)
+  Refuses to overwrite existing files unless `--force`.
+
+- **`mostajs migrate <diff | apply | status>`** — incremental DDL diff.
+  Compares `entities.json` to the live DB's column catalogue (via dialect
+  `getExistingColumns`) and :
+  - **`diff`**   : prints the ALTER TABLE statements needed to make the live
+    DB match the schema.
+  - **`apply`**  : executes those ALTERs (confirmation prompt, or `--yes` to
+    skip). Reports `N ok, M failed`.
+  - **`status`** : per-entity summary `✓ / ⚠ missing N cols / ✗ table missing`
+    + global counter.
+
+  Validated end-to-end on the FitZoneGym fixture (Oracle, 40 entities) :
+  detected 3 missing inverse-1:1 FK columns, ALTERed them, subsequent diff
+  returned `✓ Schema is up to date`.
+
+### Fixed
+
+- **`load_env` preserves existing env vars.** Pre-0.5.0, `load_env` did
+  `set -a; source config.env; set +a` — which overwrote any CLI-provided
+  `DB_DIALECT=… mostajs migrate` env, breaking multi-DB workflows. Now
+  parses `.mostajs/config.env` line-by-line and only exports keys not
+  already set in the process environment.
+- **`PROJECT_ROOT` is now overridable.** `PROJECT_ROOT=/path/to/target
+  mostajs init` previously ignored the override (hardcoded `$(pwd)`).
+  Now uses `"${PROJECT_ROOT:-$(pwd)}"` so automated tests and scripts
+  can target arbitrary directories.
+
 ## [0.4.7] — 2026-04-15
 
 ### Added — Export entities menu

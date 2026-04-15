@@ -27,7 +27,7 @@ CLI_NAME="mostajs"
 # PATHS — relative to the CALLER's CWD, not the script
 # ============================================================
 
-PROJECT_ROOT="$(pwd)"
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
 CONFIG_DIR="$PROJECT_ROOT/.mostajs"
 CONFIG_FILE="$CONFIG_DIR/config.env"
 LOG_DIR="$CONFIG_DIR/logs"
@@ -214,7 +214,16 @@ header() {
 # ============================================================
 
 load_env() {
-  [[ -f "$CONFIG_FILE" ]] && { set -a; source "$CONFIG_FILE"; set +a; }
+  # Source .mostajs/config.env WITHOUT overriding env vars that are already
+  # set (CLI invocation with DB_DIALECT=... mostajs ... takes precedence).
+  [[ -f "$CONFIG_FILE" ]] || return
+  while IFS='=' read -r key value; do
+    [[ -z "$key" || "$key" =~ ^# ]] && continue
+    # Trim whitespace from key and strip surrounding quotes from value
+    key="${key// /}"
+    value="${value%\"}"; value="${value#\"}"
+    [[ -z "${!key+x}" ]] && export "$key=$value"
+  done < "$CONFIG_FILE"
 }
 
 save_var() {
@@ -2637,6 +2646,364 @@ EOF
 }
 
 # ============================================================
+# `mostajs init` — scaffold a new project
+# ============================================================
+#
+# Creates every file a fresh project needs to run on the bridge :
+#   - .env with PORT / DB_DIALECT / SGBD_URI / AUTH_SECRET
+#   - prisma/schema.prisma (minimal User model — starting point)
+#   - src/lib/db.ts (createPrismaLikeDb)
+#   - .mostajs/config.env (mirrors .env for the seed-runner)
+#   - .mostajs/generated/entities.json (empty array, filled by menu 1)
+#
+# Dialect defaults to sqlite ./data.sqlite. Pass --dialect=postgres etc.
+# Refuses to overwrite existing files unless --force.
+
+action_cli_init() {
+  local dialect="sqlite"
+  local uri=""
+  local force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dialect) dialect="$2"; shift 2 ;;
+      --dialect=*) dialect="${1#*=}"; shift ;;
+      --uri)     uri="$2"; shift 2 ;;
+      --uri=*)   uri="${1#*=}"; shift ;;
+      --force|-f) force=1; shift ;;
+      *) warn "Unknown flag: $1"; shift ;;
+    esac
+  done
+
+  # Default URIs per dialect
+  if [[ -z "$uri" ]]; then
+    case "$dialect" in
+      sqlite)      uri="./data.sqlite" ;;
+      postgres)    uri="postgres://user:pass@localhost:5432/mydb" ;;
+      mysql)       uri="mysql://user:pass@localhost:3306/mydb" ;;
+      mariadb)     uri="mariadb://user:pass@localhost:3306/mydb" ;;
+      mongodb)     uri="mongodb://user:pass@localhost:27017/mydb" ;;
+      oracle)      uri="oracle://user:pass@localhost:1521/XE" ;;
+      mssql)       uri="mssql://user:pass@localhost:1433/mydb" ;;
+      cockroachdb) uri="postgresql://user:pass@localhost:26257/mydb?sslmode=disable" ;;
+      *)           uri="./data.sqlite"; dialect="sqlite" ;;
+    esac
+  fi
+
+  header
+  echo -e "${BOLD}${MAGENTA}▶ mostajs init — scaffold a bridge-ready project${RESET}"
+  echo
+  echo -e "  Dialect : ${CYAN}${dialect}${RESET}"
+  echo -e "  URI     : ${DIM}${uri}${RESET}"
+  echo -e "  Root    : ${DIM}${PROJECT_ROOT}${RESET}"
+  echo
+
+  local created=0 skipped=0
+
+  write_if_missing() {
+    local path="$1"; local content="$2"
+    if [[ -f "$PROJECT_ROOT/$path" && $force -eq 0 ]]; then
+      dim "  - skip $path (exists — use --force to overwrite)"
+      ((skipped++))
+      return
+    fi
+    mkdir -p "$(dirname "$PROJECT_ROOT/$path")"
+    printf '%s' "$content" > "$PROJECT_ROOT/$path"
+    ok "created $path"
+    ((created++))
+  }
+
+  # --- .env ---
+  local secret
+  secret=$(node -e "console.log(require('crypto').randomBytes(32).toString('base64'))" 2>/dev/null || echo 'CHANGE-ME-IN-PROD')
+  write_if_missing ".env" "\
+# Port — used by next dev / start (reads PORT from here)
+PORT=3000
+
+# Database — consumed by @mostajs/orm-bridge (createPrismaLikeDb)
+DB_DIALECT=${dialect}
+SGBD_URI=${uri}
+DB_SCHEMA_STRATEGY=update
+
+# NextAuth (if you use it)
+NEXTAUTH_URL=http://localhost:3000
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+AUTH_SECRET=${secret}
+"
+
+  # --- .mostajs/config.env (mirror for the seed-runner) ---
+  write_if_missing ".mostajs/config.env" "\
+DB_DIALECT=${dialect}
+SGBD_URI=${uri}
+DB_SCHEMA_STRATEGY=update
+APP_PORT=3000
+"
+
+  # --- .mostajs/generated/entities.json (empty — filled by menu 1) ---
+  write_if_missing ".mostajs/generated/entities.json" "[]
+"
+
+  # --- prisma/schema.prisma (minimal starter) ---
+  # Prisma's valid providers : sqlite, postgresql, mysql, mongodb, sqlserver, cockroachdb
+  local provider="$dialect"
+  case "$dialect" in
+    postgres|postgresql) provider="postgresql" ;;
+    mssql)               provider="sqlserver" ;;
+    mariadb)             provider="mysql" ;;
+    oracle|db2|hana|hsqldb|spanner|sybase) provider="sqlite" ;;  # Prisma has no native provider — keep sqlite placeholder
+  esac
+  write_if_missing "prisma/schema.prisma" "\
+// Minimal starter — edit freely. Run 'mostajs' menu 1 to convert to EntitySchema.
+generator client {
+  provider = \"prisma-client-js\"
+}
+
+datasource db {
+  provider = \"${provider}\"
+  url      = env(\"DATABASE_URL\")
+}
+
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  password      String
+  name          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+"
+
+  # --- src/lib/db.ts (createPrismaLikeDb) ---
+  write_if_missing "src/lib/db.ts" "\
+// Generated by 'mostajs init' — @mostajs/orm-bridge entry point.
+// Every Prisma-style db.User.findUnique(...) call below is routed to
+// @mostajs/orm (13 dialects). Edit DB_DIALECT / SGBD_URI in .env to switch.
+import { createPrismaLikeDb } from '@mostajs/orm-bridge/prisma-client'
+
+export const db = createPrismaLikeDb()
+"
+
+  echo
+  echo -e "  ${BOLD}${created}${RESET} file(s) created, ${DIM}${skipped}${RESET} skipped"
+  echo
+  echo -e "  ${BOLD}Next steps${RESET} :"
+  echo -e "    ${CYAN}1.${RESET} npm install @mostajs/orm @mostajs/orm-bridge @mostajs/orm-cli --legacy-peer-deps"
+  echo -e "    ${CYAN}2.${RESET} Edit ${DIM}prisma/schema.prisma${RESET} — add your models"
+  echo -e "    ${CYAN}3.${RESET} ${CYAN}mostajs${RESET} → menu 1 (Convert) → menu 3 (init DDL)"
+  echo -e "    ${CYAN}4.${RESET} ${CYAN}mostajs${RESET} → menu S (Seeds) — populate, hash, apply"
+  echo -e "    ${CYAN}5.${RESET} ${CYAN}npm run dev${RESET}"
+}
+
+# ============================================================
+# `mostajs migrate` — incremental DDL diff / apply / status
+# ============================================================
+#
+# Subcommands :
+#   diff    — list ALTERs needed to make the live DB match entities.json
+#   apply   — execute those ALTERs (prompts for confirmation, --yes to skip)
+#   status  — show entities.json count + live tables count + missing columns
+
+action_cli_migrate() {
+  local sub="${1:-}"
+  [[ -z "$sub" ]] && { action_migrate_help; return; }
+  shift
+  case "$sub" in
+    diff|d)     action_migrate_diff "$@" ;;
+    apply|a)    action_migrate_apply "$@" ;;
+    status|s)   action_migrate_status "$@" ;;
+    help|h|--help) action_migrate_help ;;
+    *) err "Unknown migrate subcommand: $sub"; action_migrate_help; return 1 ;;
+  esac
+}
+
+action_migrate_help() {
+  cat <<EOF
+
+  ${BOLD}mostajs migrate${RESET} — incremental schema migration
+
+    ${CYAN}diff${RESET}     show ALTER statements the DB needs to match entities.json
+    ${CYAN}apply${RESET}    execute those ALTERs (prompts for confirmation)
+             flags : --yes (skip confirmation)
+    ${CYAN}status${RESET}   show live-vs-schema summary per entity
+
+  Every subcommand honors DB_DIALECT + SGBD_URI from ${DIM}.mostajs/config.env${RESET}.
+
+EOF
+}
+
+# Node helper : compare live columns vs schema.fields and emit ALTER plan as JSON.
+# Outputs to stdout : { changes: [{ table, column, sql }], ok: bool }
+_migrate_compute_plan() {
+  load_env
+  local entities_json="$GENERATED_DIR/entities.json"
+  if [[ ! -f "$entities_json" ]]; then
+    err "No entities.json — run menu 1 (Convert) first."
+    return 1
+  fi
+  ENT_PATH="$entities_json" DIALECT="$DB_DIALECT" URI="$SGBD_URI" \
+  node --input-type=module -e "
+    import { readFileSync } from 'node:fs';
+    import { getDialect } from '${PROJECT_ROOT}/node_modules/@mostajs/orm/dist/index.js';
+    const entities = JSON.parse(readFileSync(process.env.ENT_PATH, 'utf8'));
+    const d = await getDialect({ dialect: process.env.DIALECT, uri: process.env.URI, schemaStrategy: 'none' });
+
+    // Use the dialect's own introspection — protected method, exposed via cast
+    const changes = [];
+    for (const e of entities) {
+      let live;
+      try {
+        live = await (d).getExistingColumns(e.collection);
+      } catch {
+        changes.push({ table: e.collection, column: '*', sql: '-- (cannot introspect — run menu 3 first)' });
+        continue;
+      }
+      const hasCol = (name) => {
+        const lc = name.toLowerCase();
+        for (const c of live) if (c.toLowerCase() === lc) return true;
+        return false;
+      };
+      // Field columns
+      for (const [name, f] of Object.entries(e.fields || {})) {
+        if (name === '_id') continue;
+        if (hasCol(name)) continue;
+        // Reconstruct the ALTER — d has fieldToSqlType + getIdColumnType + quoteIdentifier
+        const q = (n) => (d).quoteIdentifier(n);
+        let sql;
+        if (name === 'id') {
+          sql = 'ALTER TABLE ' + q(e.collection) + ' ADD ' + q('id') + ' ' + (d).getIdColumnType();
+        } else {
+          sql = 'ALTER TABLE ' + q(e.collection) + ' ADD ' + q(name) + ' ' + (d).fieldToSqlType(f);
+        }
+        changes.push({ table: e.collection, column: name, sql });
+      }
+      // Relation FK columns
+      for (const [rname, rel] of Object.entries(e.relations || {})) {
+        if (rel.type !== 'many-to-one' && rel.type !== 'one-to-one') continue;
+        const colName = rel.joinColumn || (rname + 'Id');
+        if (hasCol(colName)) continue;
+        const q = (n) => (d).quoteIdentifier(n);
+        changes.push({
+          table: e.collection, column: colName,
+          sql: 'ALTER TABLE ' + q(e.collection) + ' ADD ' + q(colName) + ' ' + (d).getIdColumnType(),
+        });
+      }
+    }
+    await d.disconnect();
+    console.log(JSON.stringify({ ok: true, changes }));
+  "
+}
+
+action_migrate_diff() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ mostajs migrate diff${RESET}"
+  echo
+  local plan_json
+  plan_json=$(_migrate_compute_plan) || { pause; return 1; }
+  local count
+  count=$(echo "$plan_json" | node -e "process.stdin.on('data',d=>{console.log(JSON.parse(d).changes.length)})" 2>/dev/null || echo '?')
+  if [[ "$count" == "0" ]]; then
+    ok "Schema is up to date — nothing to ALTER."
+    return 0
+  fi
+  echo -e "  ${BOLD}${count}${RESET} pending change(s) :"
+  echo
+  echo "$plan_json" | node -e "
+    let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+      const p = JSON.parse(d);
+      for (const ch of p.changes) console.log('  ' + ch.sql + ';');
+    });
+  "
+  echo
+  echo -e "  Run ${CYAN}mostajs migrate apply${RESET} to execute these statements."
+}
+
+action_migrate_apply() {
+  local auto_yes=0
+  [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]] && auto_yes=1
+  header
+  echo -e "${BOLD}${MAGENTA}▶ mostajs migrate apply${RESET}"
+  echo
+  local plan_json
+  plan_json=$(_migrate_compute_plan) || return 1
+  local count
+  count=$(echo "$plan_json" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).changes.length))" 2>/dev/null || echo 0)
+  if [[ "$count" == "0" ]]; then
+    ok "Schema is up to date — nothing to ALTER."
+    return 0
+  fi
+  echo "  Pending : ${BOLD}${count}${RESET} statement(s)"
+  echo
+  echo "$plan_json" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{for(const ch of JSON.parse(d).changes) console.log('  ' + ch.sql + ';')})"
+  echo
+  if [[ $auto_yes -eq 0 ]]; then
+    if ! confirm "Execute these ALTER statements?"; then
+      dim "  Aborted."
+      return
+    fi
+  fi
+
+  # Execute
+  load_env
+  PLAN="$plan_json" DIALECT="$DB_DIALECT" URI="$SGBD_URI" \
+  node --input-type=module -e "
+    import { getDialect } from '${PROJECT_ROOT}/node_modules/@mostajs/orm/dist/index.js';
+    const plan = JSON.parse(process.env.PLAN);
+    const d = await getDialect({ dialect: process.env.DIALECT, uri: process.env.URI, schemaStrategy: 'none' });
+    let ok = 0, fail = 0;
+    for (const ch of plan.changes) {
+      try {
+        await d.executeRun(ch.sql, []);
+        console.log('  ✓ ' + ch.table + '.' + ch.column);
+        ok++;
+      } catch (e) {
+        console.error('  ✗ ' + ch.table + '.' + ch.column + ' : ' + e.message);
+        fail++;
+      }
+    }
+    await d.disconnect();
+    console.log('\nApplied : ' + ok + ' ok, ' + fail + ' failed');
+    process.exit(fail > 0 ? 1 : 0);
+  "
+}
+
+action_migrate_status() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ mostajs migrate status${RESET}"
+  echo
+  load_env
+  local ent_json="$GENERATED_DIR/entities.json"
+  if [[ ! -f "$ent_json" ]]; then
+    err "No entities.json — run menu 1 (Convert) first."
+    return 1
+  fi
+  ENT_PATH="$ent_json" DIALECT="$DB_DIALECT" URI="$SGBD_URI" \
+  node --input-type=module -e "
+    import { readFileSync } from 'node:fs';
+    import { getDialect } from '${PROJECT_ROOT}/node_modules/@mostajs/orm/dist/index.js';
+    const entities = JSON.parse(readFileSync(process.env.ENT_PATH, 'utf8'));
+    const d = await getDialect({ dialect: process.env.DIALECT, uri: process.env.URI, schemaStrategy: 'none' });
+    let existing = 0, missing = 0, lagging = 0;
+    for (const e of entities) {
+      let live;
+      try { live = await (d).getExistingColumns(e.collection); }
+      catch { live = new Set(); }
+      if (!live || live.size === 0) { console.log('  ✗ ' + e.collection + ' — table not found'); missing++; continue; }
+      const hasCol = (n) => { const lc = n.toLowerCase(); for (const c of live) if (c.toLowerCase() === lc) return true; return false; };
+      const schemaCols = Object.keys(e.fields || {});
+      const need = schemaCols.filter(c => !hasCol(c));
+      if (need.length) {
+        console.log('  ⚠ ' + e.collection + ' — missing ' + need.length + ' column(s) : ' + need.join(', '));
+        lagging++;
+      } else {
+        console.log('  ✓ ' + e.collection + ' (' + live.size + ' cols live, ' + schemaCols.length + ' in schema)');
+        existing++;
+      }
+    }
+    await d.disconnect();
+    console.log('\n  ' + existing + ' up-to-date · ' + lagging + ' need migrate · ' + missing + ' missing');
+  "
+}
+
+# ============================================================
 # CLI SUBCOMMANDS (non-interactive)
 # ============================================================
 
@@ -2720,6 +3087,26 @@ run_subcommand() {
       ;;
     health|h)
       action_healthcheck
+      ;;
+    init)
+      # mostajs init [--dialect sqlite|postgres|mongodb|...] [--force]
+      # Scaffold a fresh project with bridge-ready layout :
+      #   .env (PORT, DB_DIALECT, SGBD_URI, AUTH_SECRET)
+      #   prisma/schema.prisma (minimal — User model only)
+      #   src/lib/db.ts (createPrismaLikeDb)
+      #   .mostajs/config.env (mirrors .env for the runner)
+      #   .mostajs/generated/entities.json (empty array)
+      shift
+      action_cli_init "$@"
+      ;;
+    migrate|mig|m)
+      # mostajs migrate <subcommand> [options]
+      # Subcommands :
+      #   diff    — show ALTER statements the target DB needs to match entities.json
+      #   apply   — execute those ALTERs (with confirmation)
+      #   status  — show what's in entities.json vs what's live in the DB
+      shift
+      action_cli_migrate "$@"
       ;;
     install-bridge|ib)
       # mostajs install-bridge [--apply] [--file X] [--project P] [--restore]
