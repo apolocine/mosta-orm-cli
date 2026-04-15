@@ -2,6 +2,20 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.4.7] — 2026-04-15
+
+### Added — Export entities menu
+
+- **Menu `e`) Export entities** — interactive picker that converts the
+  project's `entities.json` into another schema format using
+  `@mostajs/orm-adapter@0.6.0+` reverse adapters :
+  - `1) Prisma`        → `prisma/schema.prisma`
+  - `2) JSON Schema`   → `schema.json` (2020-12)
+  - `3) OpenAPI 3.1`   → `openapi.json`
+  - `4) Native (TS)`   → `src/schemas.ts` (`export const schemas: EntitySchema[]`)
+- Output path is configurable at prompt time. Parent directory is
+  auto-created if missing.
+
 ## [0.4.6] — 2026-04-15
 
 ### Fixed
