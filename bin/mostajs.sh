@@ -1938,7 +1938,8 @@ action_rep_add_replica() {
   dim "  Use a SHORT IDENTIFIER here (NOT a database URI — the URI comes later)."
   echo
   local project name role dialect uri lag
-  project=$(ask "Project name (short id, e.g. 'fitzone')" "fitzone")
+  # Use the smart project picker (lists known projects, suggests first)
+  project=$(_pick_project)
   # Basic validation : reject URIs or paths
   if [[ "$project" == *"://"* || "$project" == *"/"* ]]; then
     err "  Project name looks like a URI or path. Use a short identifier (e.g. 'fitzone')."
@@ -1984,9 +1985,34 @@ action_rep_add_replica() {
   pause
 }
 
+# List known projects from the replicator-tree.json — if any — and propose
+# the first one as default. Echoes the chosen project name to stdout.
+# Returns 1 if user cancelled.
+_pick_project() {
+  local tree_file
+  tree_file=$(_replicator_tree_file)
+  local projects=()
+  if [[ -f "$tree_file" ]]; then
+    while IFS= read -r p; do projects+=("$p"); done < <(
+      node -e "try{const t=JSON.parse(require('fs').readFileSync('$tree_file','utf8'));for(const k of Object.keys(t.replicas||{}))console.log(k)}catch{}" 2>/dev/null
+    )
+  fi
+  local default_project="fitzone"
+  if [[ ${#projects[@]} -gt 0 ]]; then
+    default_project="${projects[0]}"
+    if [[ ${#projects[@]} -gt 1 ]]; then
+      echo >&2
+      dim "  Known projects : ${projects[*]}" >&2
+    fi
+  fi
+  local picked
+  picked=$(ask "Project name" "$default_project")
+  echo "$picked"
+}
+
 action_rep_list_replicas() {
   local project
-  project=$(ask "Project name" "default")
+  project=$(_pick_project)
   _replicator_run "
     const status = rm.getReplicaStatus('$project');
     if (!status || status.length === 0) {
@@ -2002,7 +2028,7 @@ action_rep_list_replicas() {
 
 action_rep_promote() {
   local project name
-  project=$(ask "Project name" "default")
+  project=$(_pick_project)
   name=$(ask    "Slave to promote" "slave-1")
   if ! confirm "Promote '$name' to master on project '$project'?"; then return; fi
   _replicator_run "
@@ -2015,7 +2041,7 @@ action_rep_promote() {
 
 action_rep_remove_replica() {
   local project name
-  project=$(ask "Project name" "default")
+  project=$(_pick_project)
   name=$(ask    "Replica name" "slave-1")
   if ! confirm "Remove replica '$name' from project '$project'?"; then return; fi
   _replicator_run "
@@ -2028,7 +2054,7 @@ action_rep_remove_replica() {
 
 action_rep_set_routing() {
   local project strategy
-  project=$(ask "Project name" "default")
+  project=$(_pick_project)
   strategy=$(ask "Strategy (round-robin | least-lag | random)" "least-lag")
   _replicator_run "
     rm.setReadRouting('$project', '$strategy');

@@ -2,6 +2,22 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.5.5] — 2026-04-15
+
+### Fixed — Replicator menu : smart project picker
+
+Every replicator action that asked for a project name was hard-coded to
+default to `'default'`, even when the tree-file had `'fitzone'` registered.
+Result : after adding a replica to `fitzone`, listing replicas
+(`menu r → 2`) showed an empty list because the user pressed Enter and
+got `default`.
+
+New `_pick_project` helper :
+- Reads `.mostajs/replicator-tree.json` and lists known projects
+- Defaults to the first one (or `'fitzone'` if empty)
+- When >1 projects exist, displays them inline above the prompt
+- Used by Add / List / Promote / Remove / Set-routing actions
+
 ## [0.5.4] — 2026-04-15
 
 ### Fixed — Menu `r → 1` (Add replica) UX
