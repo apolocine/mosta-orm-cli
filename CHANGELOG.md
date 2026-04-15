@@ -2,6 +2,20 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.5.2] — 2026-04-15
+
+### Added
+
+- **Menu `r → m) Open monitor`** — spawns
+  [`@mostajs/replica-monitor`](https://www.npmjs.com/package/@mostajs/replica-monitor)
+  in background and opens the dashboard in the default browser :
+  - auto-installs `@mostajs/replica-monitor` if missing
+  - port + token prompted (default `14499`, no auth)
+  - pid tracked in `.mostajs/monitor.pid`, logs to `.mostajs/monitor.log`
+  - idempotent : if a monitor is already running, just re-opens the URL
+  - launcher : `xdg-open` (Linux) / `open` (macOS)
+  - stop with `kill $(cat .mostajs/monitor.pid)`
+
 ## [0.5.1] — 2026-04-15
 
 ### Added — Replicator menu (`r`)

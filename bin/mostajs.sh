@@ -1798,6 +1798,7 @@ menu_replicator() {
   echo -e "  ${CYAN}7${RESET}) List CDC rules"
   echo -e "  ${CYAN}8${RESET}) Run a CDC sync + show stats"
   echo -e "  ${CYAN}9${RESET}) Remove a CDC rule"
+  echo -e "  ${CYAN}m${RESET}) ${BOLD}Open monitor${RESET} (live dashboard — localhost:14499)"
   echo -e "  ${CYAN}v${RESET}) View the raw tree file"
   echo -e "  ${CYAN}c${RESET}) Clear (delete the tree file — DESTRUCTIVE)"
   echo
@@ -1815,6 +1816,7 @@ menu_replicator() {
     7) action_rep_list_rules ;;
     8) action_rep_sync ;;
     9) action_rep_remove_rule ;;
+    m|M) action_rep_open_monitor ;;
     v|V) action_rep_view_tree ;;
     c|C) action_rep_clear ;;
     b|B) return ;;
@@ -1960,6 +1962,65 @@ action_rep_remove_rule() {
     await save();
     console.log('  ✓ removed : $name');
   "
+  pause
+}
+
+action_rep_open_monitor() {
+  header
+  echo -e "${BOLD}${MAGENTA}▶ Open replica-monitor dashboard${RESET}"
+  echo
+  # Ensure the monitor package is installed
+  if [[ ! -d "$PROJECT_ROOT/node_modules/@mostajs/replica-monitor" ]]; then
+    warn "@mostajs/replica-monitor not installed in this project."
+    if confirm "Install it now?"; then
+      ensure_pkg "@mostajs/replica-monitor" || { pause; return; }
+    else
+      pause; return
+    fi
+  fi
+  local tree_file
+  tree_file=$(_replicator_tree_file)
+  local port
+  port=$(ask "Port" "14499")
+  local token
+  token=$(ask "Auth token (empty = no auth, local-only)" "")
+  local url_suffix=""
+  [[ -n "$token" ]] && url_suffix="?token=${token}"
+
+  local log_file="$PROJECT_ROOT/.mostajs/monitor.log"
+  local pid_file="$PROJECT_ROOT/.mostajs/monitor.pid"
+
+  # If already running (pid file exists + process alive) : just open the URL.
+  if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+    ok "Monitor already running at http://127.0.0.1:${port}"
+  else
+    # Spawn in background
+    echo -e "  ${DIM}spawning mostajs-monitor …${RESET}"
+    MONITOR_TREE="$tree_file" MONITOR_PORT="$port" MONITOR_TOKEN="$token" \
+    nohup node "$PROJECT_ROOT/node_modules/@mostajs/replica-monitor/dist/cli.js" \
+      --tree "$tree_file" --port "$port" --runtime "$PROJECT_ROOT" \
+      ${token:+--token "$token"} \
+      > "$log_file" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$pid_file"
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then
+      ok "Monitor started (pid=$pid) → http://127.0.0.1:${port}${url_suffix}"
+      dim "  logs : $log_file"
+      dim "  stop : kill \$(cat $pid_file)  or  menu r → m again then Ctrl+C"
+    else
+      err "Monitor failed to start — check $log_file"
+      cat "$log_file" | tail -10
+      pause; return
+    fi
+  fi
+
+  # Try to open in default browser
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "http://127.0.0.1:${port}${url_suffix}" >/dev/null 2>&1 &
+  elif command -v open >/dev/null 2>&1; then
+    open "http://127.0.0.1:${port}${url_suffix}" >/dev/null 2>&1 &
+  fi
   pause
 }
 
