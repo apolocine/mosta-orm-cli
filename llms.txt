@@ -1,0 +1,75 @@
+# @mostajs/orm-cli — fiche LLM
+> CLI universelle pour intégrer @mostajs/orm — `mostajs bootstrap` migre un projet Prisma vers 13 bases sans toucher au code.
+
+- Version: 0.6.4 · Licence: AGPL-3.0-or-later · Auteur: Dr Hamid MADANI <drmdh@msn.com>
+- Chemin: mostajs/mosta-orm-cli · Statut audit: partiel (paquet bin/ uniquement, pas de dist/ TS exporté)
+
+## RÔLE
+Outil en ligne de commande. La commande phare `mostajs bootstrap` migre un projet Prisma
+existant vers @mostajs/orm en une passe : codemod (réécriture des `new PrismaClient(...)`),
+installation des runtimes, conversion du schéma, application du DDL. Aucun changement de code
+applicatif n'est requis. Fournit aussi un menu interactif et des sous-commandes utilitaires.
+Ce paquet est un exécutable (bin), pas une bibliothèque importable.
+
+## INSTALLATION
+npx @mostajs/orm-cli bootstrap        # zero-install (recommandé)
+npm install -g @mostajs/orm-cli       # global -> commande `mostajs`
+
+## EXPORTS
+Aucun export de bibliothèque. Le paquet expose un binaire :
+- `mostajs` -> ./bin/mostajs-launcher.cjs
+Fichiers bin : mostajs-launcher.cjs, install-bridge.mjs, mostajs.sh, mostajs.bat.
+
+## API — SOUS-COMMANDES
+- `mostajs bootstrap` — migration complète : codemod + install + convert + DDL
+  (chaque étape s'arrête à la première erreur, v0.4.1+)
+- `mostajs install-bridge` — lance le codemod en dry-run (rapport, aucune écriture)
+- `mostajs install-bridge --apply` — applique les changements du codemod
+- `mostajs install-bridge --file <path>` — restreint le codemod à un fichier
+- `mostajs install-bridge --restore --apply` — restaure les sauvegardes `*.prisma.bak`
+- `mostajs convert` — auto-détecte le schéma (Prisma / OpenAPI / JSONSchema) et le convertit
+- `mostajs detect` — affiche ce qui est détecté dans le projet
+- `mostajs health` — vérifie Node / pnpm / schémas / état de entities.json
+- `mostajs hash <password> [cost]` — hash bcrypt d'un mot de passe (données de seed)
+- `mostajs verify <password> <hash>` — vérifie une paire mot de passe / hash
+- `mostajs diagnose [email] [password]` — diagnostic de login
+- `mostajs help` / `mostajs version`
+- `mostajs` (sans argument) — menu interactif (convert, config URIs, init dialectes,
+  tests, services, métriques, logs, health, génération boilerplate, seeding, bootstrap)
+
+## TYPES CLÉS
+Sans objet — paquet purement CLI.
+
+## PATTERN
+```bash
+cd my-existing-prisma-app
+npx @mostajs/orm-cli bootstrap
+npm run dev
+# db.User.findMany(...) tourne maintenant sur l'un des 13 SGBD. Zéro changement de code.
+
+# pour annuler :
+npx @mostajs/orm-cli install-bridge --restore --apply
+```
+Le codemod réécrit chaque site `new PrismaClient(...)` en `createPrismaLikeDb()` importé
+de `@mostajs/orm-bridge/prisma-client`, sauvegarde l'original en `<fichier>.prisma.bak`,
+et préserve la forme d'export (`const db`, `const prisma`, `export default`…).
+Le bootstrap produit `.mostajs/config.env`, `.mostajs/generated/entities.json`,
+`.mostajs/seeds/*.json` et `.mostajs/logs/`.
+
+## DÉPEND DE
+- @mostajs/orm (dependency directe). À l'exécution, installe aussi dans le projet cible
+  @mostajs/orm-bridge et @mostajs/orm-adapter.
+- bcryptjs (hash/verify), better-sqlite3 (DDL SQLite par défaut)
+
+## PIÈGES
+- `install-bridge` est dry-run PAR DÉFAUT — il faut `--apply` pour écrire les fichiers.
+- Détection codemod : fichier devant contenir `import ... from '@prisma/client'` ET
+  `new PrismaClient(`. Les fichiers déjà migrés vers `@mostajs/orm-bridge/prisma-client`
+  sont ignorés (ré-exécution idempotente).
+- Conversion de schéma : passe par @mostajs/orm-adapter (Prisma / OpenAPI / JSON Schema).
+- Le bootstrap configure SQLite par défaut ; changer ensuite `DB_DIALECT` + `SGBD_URI`
+  dans `.mostajs/config.env` (ou `.env`) pour cibler un autre des 13 SGBD.
+- Paquet non importable — ne pas tenter `import ... from '@mostajs/orm-cli'`.
+
+## RÉFÉRENCES
+- README.md · CHANGELOG.md · docs/How2.md, docs/MONITORING.md · install.sh
