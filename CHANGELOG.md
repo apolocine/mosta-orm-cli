@@ -2,6 +2,51 @@
 
 All notable changes to `@mostajs/orm-cli` will be documented in this file.
 
+## [0.7.0] — 2026-06-15
+
+### Added — Mongo migration trio : `mongo-introspect` · `validate` · `fix-ids`
+
+Three commands turn a live Mongo project into a data-plug one, using the ORM's
+own mongo dialect (which normalizes `_id`→`id`, ids as strings, every dialect) :
+
+- **`mostajs mongo-introspect`** (`bin/mongo-introspect.mjs`, menu `m`) — *migrer* :
+  connects to a live MongoDB, samples docs per collection, infers `EntitySchema[]`
+  (types, `required`, real indexes, `timestamps`; `_id`/`__v` dropped, ObjectId →
+  `string`) and writes `.mostajs/generated/entities.json` — so a Mongo project with
+  no Prisma/OpenAPI schema can adopt `@mostajs/orm`. Uses `$SGBD_URI` by default.
+- **`mostajs validate`** (`bin/validate.mjs`, menu `v`) — *valider* : runs the
+  published `@mostajs/orm/validator` (ORMConceptValidator, rules R001–R021) over
+  `entities.json` with text/json/markdown reporters, `--src` for cross-file rules,
+  and a `--ci`/`--max-warnings` gate.
+- **`mostajs fix-ids`** (`bin/fix-mongo-id.mjs`, menu `f`) — *corriger* : see below.
+- **`mostajs load-data`** (menu `l`) — *charger* : `.env`-piloted cross-dialect data
+  load. Thin DELEGATE to `@mostajs/orm-copy-data`'s new `mostajs-load` bin (where the
+  feature lives) — picks one of four sources (live Mongo · mongodump+mongorestore ·
+  JSON · SQL), reads the destination from `.env` (`DB_DIALECT`/`SGBD_URI`, MOSTA_ENV
+  cascade), and calls `copyData()`. Schemas from `entities.json` (chain with
+  `mongo-introspect`). NB : for large collections use `--batch-size ≥ collection size`
+  (a skip/limit pagination instability in copy-data's db-loader can otherwise re-read
+  rows → duplicate-PK errors ; copy-data's writer now surfaces the first error).
+
+### Added — `mostajs fix-ids` : Mongo → data-plug code repair codemod
+
+New codemod (`bin/fix-mongo-id.mjs`, menu `f`, subcommand `fix-ids`) that repairs
+the residue a Mongoose → `@mostajs/orm` migration leaves in **application code**.
+The ORM normalizer maps `_id`→`id` and exposes ids as plain strings for **every
+dialect, MongoDB included** — so the app must read `obj.id`, never `obj._id`, and
+must stop wrapping ids in `ObjectId`. The codemod, conservative and reversible:
+
+- renames member access `obj._id` / `obj?._id` / `obj['_id']` → `obj.id`
+  (object **keys** like a schema's `_id:` declaration are left intact) ;
+- unwraps `new ObjectId(x)` / `mongoose.Types.ObjectId(x)` / `Types.ObjectId(x)`
+  → `x` (balanced-paren aware) ;
+- reports `ObjectId.isValid(...)` and `ObjectId` imports for manual review ;
+- skips files importing `mongoose` (real models) unless `--include-mongoose` ;
+- dry-run by default ; `--apply` writes with `*.mongoid.bak` backups ;
+  `--restore --apply` reverts. Extra `--map old:new` for custom member renames.
+
+Usage : `mostajs fix-ids` (preview) · `mostajs fix-ids --apply` · `--restore --apply`.
+
 ## [0.5.10] — 2026-04-15
 
 ### Changed — `'*'` kept literal in tree for dynamic resolution
